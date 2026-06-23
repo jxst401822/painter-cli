@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "painter-cli"
+version = "0.1.0"
+description = "CLI tool that draws coordinate plans on an HMI via Modbus TCP"
+requires-python = ">=3.11"
+dependencies = [
+    "pymodbus>=3.0.0",
+    "click>=8.1.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "rich>=13.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+painter-cli = "painter_cli.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
