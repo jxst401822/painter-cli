@@ -80,17 +80,37 @@ looks right by opening `/tmp/trace.svg` (it renders in any browser).
 
 ## Step 3 (optional): Animated GIF preview
 
-The GIF service runs on a desktop/cloud host (not the device). Call it over
-HTTP the same way as dayin.la:
+The GIF service runs on a desktop/cloud host (not the device) at
+`http://192.168.0.113:8765`. The device has **no `curl`** — call it over
+`urllib` the same way `sugar-painting-gen` calls dayin.la (pure stdlib):
 
-```bash
-curl -s -X POST "$GIF_SERVICE_URL/render-gif" \
-  -H "Content-Type: application/json" \
-  --data-binary @/tmp/trace.json -o /tmp/trace.gif
+```python
+import urllib.request, json, sys
+
+GIF_SERVICE = "http://192.168.0.113:8765"   # LAN now; swap for a cloud URL later
+plan = open("/tmp/trace.json", "rb").read()
+req = urllib.request.Request(
+    f"{GIF_SERVICE}/render-gif",
+    data=plan,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    open("/tmp/trace.gif", "wb").write(resp.read())
+print("GIF saved: /tmp/trace.gif")
 ```
 
-`$GIF_SERVICE_URL` is configurable (local LAN now, cloud later). If the
-service is unreachable, skip this step — JSON + SVG is enough to draw.
+The endpoint host is a single constant (`GIF_SERVICE`) — swap it for a
+cloud URL later without touching anything else. If the service is
+unreachable (connection refused / timeout), catch `URLError` and skip —
+JSON + SVG is enough to draw:
+
+```python
+try:
+    ...
+except urllib.error.URLError as e:
+    print(f"GIF service unreachable, skipping: {e}")
+```
 
 ## JSON Format (machine input)
 
