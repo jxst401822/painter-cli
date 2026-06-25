@@ -59,7 +59,7 @@ Device (no PIL/numpy)                      Desktop (has PIL)
 **B. `image-to-trajectory` (rework — the core)** — `image_to_trajectory.py` is **not run on the device**. The skill becomes an "LLM vision-tracing procedure":
 
 - `SKILL.md` is rewritten to describe the tracing procedure and the JSON contract.
-- A new `trajectory_prepare.py` (pure stdlib) is the contract guardian: validates the model's normalized JSON, deterministically maps normalized `[0,1]` coordinates to ±240 integers (+clamp + Y flip), enforces stick adhesion (if no stroke crosses x≈0, prepend `[0, y]` anchor to the nearest stroke), dedups consecutive duplicate points, and renders an SVG preview. This is the "contract-execution tail" of the original CV pipeline, reimplemented in pure stdlib.
+- A new `trajectory_prepare.py` (pure stdlib) is the contract guardian: validates the model's normalized JSON, deterministically maps normalized `[0,1]` coordinates to ±240 integers (+clamp + Y flip), enforces stick adhesion (if no stroke crosses x≈0, prepend `[0, y]` anchor to the nearest stroke, reusing the original script's `STICK_TOL` convention of ≈2–4), dedups consecutive duplicate points, and renders an SVG preview in the final ±240 coordinate space. This is the "contract-execution tail" of the original CV pipeline, reimplemented in pure stdlib.
 
 **C. Desktop GIF HTTP micro-service** — A tiny HTTP wrapper over the existing `trajectory_gif.py` (unchanged): `POST /render-gif` with trajectory JSON body → `image/gif` response. The device calls it via `urllib`, identical mechanism to dayin.la. The endpoint is written into the skill's SKILL.md and made configurable.
 
