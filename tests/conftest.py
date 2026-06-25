@@ -16,3 +16,5 @@ sys.path.insert(
         "scripts",
     ),
 )
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".import_bundle", "image-to-trajectory", "scripts"))
