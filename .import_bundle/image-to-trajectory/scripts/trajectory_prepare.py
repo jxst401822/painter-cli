@@ -56,6 +56,34 @@ def dedup_points(points):
     return out
 
 
+def enforce_stick_adhesion(plan, stick_tol=STICK_TOL):
+    """Ensure at least one stroke touches the X=0 stick axis.
+
+    If no stroke crosses |x| <= stick_tol, prepend [0, y] to whichever
+    stroke contains the point closest to x=0 (using that point's y).
+    """
+    def crosses_stick(stroke):
+        return any(abs(p[0]) <= stick_tol for p in stroke["points"])
+
+    if any(crosses_stick(s) for s in plan["strokes"]):
+        return plan
+
+    best_stroke = 0
+    best_point_idx = 0
+    best_dist = float("inf")
+    for si, st in enumerate(plan["strokes"]):
+        for pi, p in enumerate(st["points"]):
+            d = abs(p[0])
+            if d < best_dist:
+                best_dist = d
+                best_stroke = si
+                best_point_idx = pi
+
+    anchor = [0, plan["strokes"][best_stroke]["points"][best_point_idx][1]]
+    plan["strokes"][best_stroke]["points"] = [anchor] + plan["strokes"][best_stroke]["points"]
+    return plan
+
+
 def parse_and_map(raw_json):
     """Validate the model's normalized JSON and map to ±240 integer strokes."""
     cleaned = _strip_code_fences(raw_json)
@@ -88,4 +116,6 @@ def parse_and_map(raw_json):
             raise TrajectoryError(f"stroke {i} has fewer than 2 points after dedup")
         strokes.append({"points": pts})
 
-    return {"description": description, "strokes": strokes}
+    plan = {"description": description, "strokes": strokes}
+    plan = enforce_stick_adhesion(plan)
+    return plan
