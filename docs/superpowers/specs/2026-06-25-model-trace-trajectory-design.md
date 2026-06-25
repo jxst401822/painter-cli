@@ -94,10 +94,10 @@ Defined by `servo/json_loader.py` and `drawing/parser.py` in the `json-modbus-se
 
 `trajectory_prepare.py` guarantees the model's output is reshaped into this contract before it reaches the machine or the GIF service.
 
-## Assumptions Requiring Verification Before Implementation
+## Confirmed Preconditions
 
-1. **quantum-bot agent has image vision capability.** Vision tracing is the premise of the whole design. If nanobot does not support vision analysis, "trace from PNG" is not viable and the design must fall back to "model natively generates" the trajectory (the rejected option). **Verify the agent's vision support first.**
-2. **A desktop machine is available on the LAN** with a stable address the device can reach, running the GIF micro-service. GIF previews require it; if absent, the skill degrades to JSON + SVG preview only.
+1. **The quantum-bot agent has image vision capability** — confirmed. Vision tracing is the premise of the whole design; it holds.
+2. **The GIF micro-service is deployed locally for now (LAN-reachable by the device), and can be redeployed to a cloud service later.** The skill must not hard-code a local IP — the endpoint is configurable so the same skill works against a local or cloud host without code changes. If the service is unreachable, the skill degrades to JSON + SVG preview only (GIF is best-effort, not blocking).
 
 ## Deliverables
 
