@@ -3,6 +3,7 @@ import pytest
 
 from trajectory_prepare import parse_and_map, map_point, TrajectoryError
 from trajectory_prepare import enforce_stick_adhesion, STICK_TOL
+from trajectory_prepare import render_svg
 
 
 def test_map_point_corners():
@@ -80,3 +81,19 @@ def test_stick_adhesion_picks_truly_nearest_point():
     anchored = out["strokes"][1]["points"][0]
     assert anchored[0] == 0
     assert anchored[1] == -5
+
+
+def test_render_svg_contains_paths_and_coords():
+    plan = _plan([[[0, 0], [100, 100]], [[0, 0], [-100, -100]]])
+    svg = render_svg(plan, size=600)
+    assert svg.startswith("<svg")
+    assert svg.rstrip().endswith("</svg>")
+    # Two strokes -> two <path> elements.
+    assert svg.count("<path") == 2
+
+
+def test_render_svg_is_valid_xml():
+    import xml.etree.ElementTree as ET
+    plan = _plan([[[0, 0], [240, 240]]])
+    svg = render_svg(plan)
+    ET.fromstring(svg)  # raises if not well-formed

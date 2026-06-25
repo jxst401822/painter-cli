@@ -119,3 +119,74 @@ def parse_and_map(raw_json):
     plan = {"description": description, "strokes": strokes}
     plan = enforce_stick_adhesion(plan)
     return plan
+
+
+COLORS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+    "#dcbeff", "#9A6324", "#800000", "#aaffc3", "#808000",
+    "#ffd8b1", "#000075", "#a9a9a9", "#fffac8", "#7cb342",
+]
+
+
+def render_svg(plan, size=600):
+    """Render a plan (±240, Y-up) to an SVG string. Pure stdlib."""
+    strokes = plan["strokes"]
+    pad = 30
+    draw = size - 2 * pad
+    scale = draw / (2 * CANVAS)
+
+    def tx(x):
+        return round(pad + (x + CANVAS) * scale)
+
+    def ty(y):
+        return round(pad + (CANVAS - y) * scale)  # Y flip for SVG (y-down)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">',
+        f'<rect width="{size}" height="{size}" fill="#111"/>',
+        # stick axis
+        f'<line x1="{tx(0)}" y1="{pad}" x2="{tx(0)}" y2="{size - pad}" '
+        f'stroke="#444" stroke-width="1"/>',
+    ]
+    for i, st in enumerate(strokes):
+        c = COLORS[i % len(COLORS)]
+        pts = st["points"]
+        d = " ".join(
+            f"{'M' if j == 0 else 'L'} {tx(p[0])} {ty(p[1])}"
+            for j, p in enumerate(pts)
+        )
+        parts.append(
+            f'<path d="{d}" fill="none" stroke="{c}" stroke-width="2.5" '
+            f'stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Validate + map a model-traced trajectory to ±240 and emit SVG.")
+    ap.add_argument("input", help="Input JSON (normalized [0,1] or already ±240)")
+    ap.add_argument("output", nargs="?", default=None, help="Output ±240 JSON path")
+    ap.add_argument("--svg", default=None, help="Also write an SVG preview here")
+    args = ap.parse_args()
+
+    with open(args.input, "r", encoding="utf-8") as f:
+        raw = f.read()
+    plan = parse_and_map(raw)
+
+    out_path = args.output or args.input.rsplit(".", 1)[0] + "_plan.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2)
+    print(f"Written: {out_path}")
+
+    svg_path = args.svg or out_path.replace(".json", ".svg")
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write(render_svg(plan))
+    print(f"SVG: {svg_path}")
+
+
+if __name__ == "__main__":
+    main()
