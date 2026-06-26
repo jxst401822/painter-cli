@@ -122,12 +122,11 @@ print(f"traced: {len(plan['strokes'])} strokes")
 preview (returned in the `svg` field — no separate call needed). This replaces
 the previous agent-vision-tracing step with a deterministic CV service call.
 
-## Step 3: Prepare the trajectory (was: run trajectory_prepare.py)
-
-Now done server-side by `/trace` — the service validates, maps to ±240
-(Y flipped: image y-down → machine y-up), enforces stick adhesion, dedups, and
-returns the SVG preview in the `svg` field. Skip this step; `/tmp/trace.json`
-and `/tmp/trace.svg` from Step 2 are already machine-ready.
+> **Note (was Step 3):** The trajectory is now finalized server-side by `/trace`
+> — the service validates, maps to ±240 (Y flipped: image y-down → machine
+> y-up), enforces stick adhesion, dedups, and returns the SVG preview in the
+> `svg` field. There is no device-side `trajectory_prepare.py` step to run;
+> `/tmp/trace.json` and `/tmp/trace.svg` from Step 2 are already machine-ready.
 
 ## Step 3: Generate the animated GIF
 
