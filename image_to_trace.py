@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from image_to_trajectory import (  # noqa: E402
     COLORS,
     MODE_DEFAULTS,
+    bbox_hugs_border,
     binarize_lineart,
     binarize_photo,
     build_plan,
@@ -77,7 +78,7 @@ RETRIEVAL_MODES = {
 
 # ─── Contour Extraction (NEW core) ──────────────────────────────────────────
 
-def extract_contours(mask, retrieval="list", min_contour_area=50):
+def extract_contours(mask, retrieval="list", min_contour_area=50, drop_border=True):
     """Run findContours on a 0/1 fg mask; return list of (N,2) float arrays
     in image coordinates (x, y; y-down). Filters noise per task.md:
     drops contours with area < min_contour_area or fewer than 3 vertices.
@@ -85,18 +86,24 @@ def extract_contours(mask, retrieval="list", min_contour_area=50):
     retrieval: 'external' (outer boundaries only — drops eyes/mouth holes),
                'list'     (all contours incl. holes, flattened — DEFAULT, recovers
                            facial features), 'tree' (all + hierarchy, v1 flattened).
+    drop_border: drop contours that run along all four image edges (the canvas/
+               frame rectangle), within a ~3% margin. Content contours rarely
+               reach all four edges, so this selectively removes the frame.
     """
     if not HAS_CV2:
         raise RuntimeError("contour extraction requires opencv-python (cv2)")
 
     mode = RETRIEVAL_MODES[retrieval]
     contours, _ = cv2.findContours(mask, mode, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = mask.shape[:2]
     out = []
     for cnt in contours:
         pts = cnt.reshape(-1, 2).astype(np.float64)            # (N,2) [x,y], y-down
         if cv2.contourArea(cnt) < min_contour_area:            # pitfall: noise
             continue
         if len(pts) < 3:                                       # pitfall: filter <3
+            continue
+        if drop_border and bbox_hugs_border(pts, h, w):        # drop canvas frame
             continue
         out.append(pts)
     # Largest first so optimize_stroke_order / area sorting see dominant shapes first
@@ -181,16 +188,17 @@ def save_debug_images_contours(binary, contours, output_path):
 
 def image_to_trace(image_path, mode="auto", max_dim=None, eps_frac=None,
                    retrieval=None, min_contour_area=50, threshold=None,
-                   closed=True, debug=False, debug_out=None):
+                   closed=True, drop_border=True, debug=False, debug_out=None):
     """Run the contour pipeline and return a plan dict ({description, strokes})
     WITHOUT writing files. This is the library entry point (mirrors
     image_to_trajectory()). main() wraps this + write_outputs for the CLI.
 
-    mode:      'auto' | 'lineart' | 'photo'
-    eps_frac:  DP epsilon as a FRACTION of arc length (0.01 = 1%). None -> mode default.
-    retrieval: 'external' | 'list' | 'tree' (default 'list' recovers inner detail)
-    closed:    append closing vertex so each contour draws as a closed loop
-    debug:     recompute binary + contours and write debug images to debug_out path
+    mode:        'auto' | 'lineart' | 'photo'
+    eps_frac:    DP epsilon as a FRACTION of arc length (0.01 = 1%). None -> mode default.
+    retrieval:   'external' | 'list' | 'tree' (default 'list' recovers inner detail)
+    closed:      append closing vertex so each contour draws as a closed loop
+    drop_border: drop contours touching the image border (canvas frame, not content)
+    debug:       recompute binary + contours and write debug images to debug_out path
     """
     if mode == "auto":
         arr_tmp = np.array(Image.open(image_path).convert("L"))
@@ -208,7 +216,8 @@ def image_to_trace(image_path, mode="auto", max_dim=None, eps_frac=None,
               else binarize_photo(gray_arr, min_contour_area=min_contour_area))
     print("Extracting contours...")
     contours = extract_contours(binary, retrieval=retrieval,
-                                min_contour_area=min_contour_area)
+                                min_contour_area=min_contour_area,
+                                drop_border=drop_border)
     print(f"  Contours: {len(contours)}")
     if not contours:
         raise ValueError("no contours found")
@@ -230,11 +239,11 @@ def image_to_trace(image_path, mode="auto", max_dim=None, eps_frac=None,
 
 def main(image_path, output_path, mode="auto", max_dim=None, eps_frac=None,
          retrieval=None, min_contour_area=50, threshold=None, closed=True,
-         debug=False):
+         drop_border=True, debug=False):
     plan = image_to_trace(image_path, mode=mode, max_dim=max_dim, eps_frac=eps_frac,
                           retrieval=retrieval, min_contour_area=min_contour_area,
-                          threshold=threshold, closed=closed, debug=debug,
-                          debug_out=output_path)
+                          threshold=threshold, closed=closed, drop_border=drop_border,
+                          debug=debug, debug_out=output_path)
     total = sum(len(st["points"]) for st in plan["strokes"])
     print(f"Final: {len(plan['strokes'])} strokes, {total} points")
     write_outputs(plan, output_path)
@@ -278,6 +287,12 @@ Examples:
                               default=True, help="Close each contour loop (default)")
     closed_group.add_argument("--no-closed", dest="closed", action="store_false",
                               help="Do not append closing vertex")
+    border_group = parser.add_mutually_exclusive_group()
+    border_group.add_argument("--drop-border", dest="drop_border", action="store_true",
+                              default=True, help="Drop contours touching the image "
+                              "border (canvas frame) — default")
+    border_group.add_argument("--keep-border", dest="drop_border", action="store_false",
+                              help="Keep border-touching contours")
     parser.add_argument("--debug", action="store_true",
                         help="Save _debug_binary.png + _debug_contours.png")
     return parser.parse_args()
@@ -295,5 +310,6 @@ if __name__ == "__main__":
         min_contour_area=args.min_contour_area,
         threshold=args.threshold,
         closed=args.closed,
+        drop_border=args.drop_border,
         debug=args.debug,
     )

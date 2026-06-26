@@ -41,6 +41,19 @@ COLORS = [
     "#ffd8b1", "#000075", "#a9a9a9", "#fffac8", "#7cb342",
 ]
 
+# ─── Border / frame detection (shared by skeleton + contour pipelines) ──────
+
+def bbox_hugs_border(points, h, w, tol_frac=0.03, tol_min=3):
+    """True if the bbox of `points` (Nx2, [x, y] y-down image coords) reaches
+    all four image edges within tol — i.e. the path runs along the canvas/frame
+    rectangle. Pure numpy, pipeline-agnostic; used to drop the border skeleton/
+    contour. tol = max(tol_min, round(tol_frac * max(h, w)))."""
+    tol = max(tol_min, int(round(tol_frac * max(h, w))))
+    x0, x1 = points[:, 0].min(), points[:, 0].max()
+    y0, y1 = points[:, 1].min(), points[:, 1].max()
+    return (x0 <= tol and x1 >= w - 1 - tol and
+            y0 <= tol and y1 >= h - 1 - tol)
+
 # ─── Image Loading ──────────────────────────────────────────────────────────
 
 def load_and_resize(image_path, max_dim):
