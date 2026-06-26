@@ -249,8 +249,14 @@ def prune_skeleton(skel, max_spur=10):
 
 # ─── Path Extraction (DFS with heading-aware traversal) ─────────────────────
 
-def extract_all_paths(skel):
-    """Extract ordered paths from skeleton using DFS traversal."""
+def extract_all_paths(skel, min_stroke_points=4):
+    """Extract ordered paths from skeleton using DFS traversal.
+
+    min_stroke_points: drop paths shorter than this (default 4) so trivial 2-3px
+    junction spurs/center fragments don't survive as strokes. trace_from already
+    follows a single curve through junctions (heading-aware); the remaining
+    loop starts nearest an already-traced stroke endpoint to extend existing
+    curves rather than spawning short center fragments."""
     h, w = skel.shape
     fg = set()
     ys, xs = np.where(skel > 0)
@@ -310,15 +316,26 @@ def extract_all_paths(skel):
     for ep in sorted(endpoints, key=lambda p: p[0]*w + p[1]):
         if ep in visited: continue
         path = trace_from(ep)
-        if len(path) >= 3:
+        if len(path) >= min_stroke_points:
             all_paths.append(path)
 
     while True:
         remaining = fg - visited
         if not remaining: break
-        start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
+        # Start nearest an already-traced stroke endpoint (extends existing
+        # curves) instead of the image centre (which spawns short fragments).
+        if all_paths:
+            endpoints_traced = []
+            for p in all_paths:
+                endpoints_traced.append((p[0][1], p[0][0]))    # (y, x) of start
+                endpoints_traced.append((p[-1][1], p[-1][0]))  # (y, x) of end
+            start = min(remaining,
+                        key=lambda q: min((q[0]-ey)**2 + (q[1]-ex)**2
+                                          for ey, ex in endpoints_traced))
+        else:
+            start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
         path = trace_from(start)
-        if len(path) >= 3:
+        if len(path) >= min_stroke_points:
             all_paths.append(path)
         else:
             visited.add(start)
@@ -379,8 +396,9 @@ def douglas_peucker(pts, eps):
 
 # ─── Coordinate Scaling ────────────────────────────────────────────────────
 
-def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
-    """Scale paths to ±240 canvas, simplify, resample."""
+def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=4):
+    """Scale paths to ±240 canvas, simplify, resample. Drops strokes with fewer
+    than min_stroke_points points after dedup (trivial fragments)."""
     all_pts = np.vstack(strokes_raw)
     cx = (all_pts[:,0].min() + all_pts[:,0].max()) / 2
     cy = (all_pts[:,1].min() + all_pts[:,1].max()) / 2
@@ -405,7 +423,7 @@ def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
         d = [scaled[0]]
         for p in scaled[1:]:
             if p != d[-1]: d.append(p)
-        if len(d) >= 2:
+        if len(d) >= min_stroke_points:
             strokes.append({"points": d})
     return strokes
 
@@ -725,34 +743,44 @@ def _render_panel(draw, strokes, x_offset, sz, label):
     draw.text((x_offset + 10, 8), f"{label} ({n} strokes, {p} pts)", fill="#666")
 
 
-def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15):
+def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15,
+                         drop_border=True, min_stroke_points=4):
     defaults = MODE_DEFAULTS[mode]
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
     else:
         binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
+    if drop_border:                                       # (a) kill border medial axis
+        binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
     skel = skeletonize(binary)
     print(f"  Skeleton: {np.count_nonzero(skel)} pixels")
     if prune > 0:
         skel = prune_skeleton(skel, max_spur=prune)
         print(f"  Pruned: {np.count_nonzero(skel)} pixels")
-    paths = extract_all_paths(skel)
+    paths = extract_all_paths(skel, min_stroke_points=min_stroke_points)
+    if drop_border and paths:                             # (b) drop frame-hugging strokes
+        h, w = skel.shape
+        paths = [p for p in paths if not bbox_hugs_border(p, h, w)]
     if not paths:
         return [], {}
     smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in paths]
-    strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"])
+    strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"],
+                              min_stroke_points=min_stroke_points)
     strokes = enforce_connectivity(strokes)
     strokes = optimize_stroke_order(strokes)
     return strokes, defaults
 
 
-def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=15):
+def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=15,
+                   drop_border=True, min_stroke_points=4):
     from PIL import ImageDraw
     print("\n== Line Art Mode ==")
-    strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune)
+    strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune,
+                                         drop_border=drop_border, min_stroke_points=min_stroke_points)
     plan_la = build_plan(strokes_la, "Line art mode")
     print("\n== Photo Mode ==")
-    strokes_ph, _ = _run_single_pipeline(gray_arr, "photo", min_contour_area=min_contour_area, prune=prune)
+    strokes_ph, _ = _run_single_pipeline(gray_arr, "photo", min_contour_area=min_contour_area, prune=prune,
+                                         drop_border=drop_border, min_stroke_points=min_stroke_points)
     plan_ph = build_plan(strokes_ph, "Photo mode")
     base = output_path.replace('.json', '')
     write_outputs(plan_la, f"{base}_lineart.json")
@@ -777,11 +805,16 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 
 def image_to_trajectory(image_path, mode="auto", max_dim=None,
                         smooth_sigma=None, simplify_eps=None, resample_n=None,
-                        threshold=None, min_contour_area=50, prune=15):
+                        threshold=None, min_contour_area=50, prune=15,
+                        drop_border=True, min_stroke_points=4):
     """Run the CV pipeline and return a plan dict ({description, strokes}) WITHOUT writing files.
 
     This is the library entry point used by gif_service's /trace endpoint.
     main() wraps this + write_outputs for the CLI.
+
+    drop_border: zero the mask border + drop frame-hugging skeleton strokes
+                 (removes the canvas-frame medial axis).
+    min_stroke_points: drop strokes shorter than this (trivial junction fragments).
     """
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
@@ -799,16 +832,22 @@ def image_to_trajectory(image_path, mode="auto", max_dim=None,
     print("Binarizing...")
     binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
         else binarize_photo(gray_arr, min_contour_area=min_contour_area)
+    if drop_border:                                       # (a) kill border medial axis
+        binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
     print("Skeletonizing...")
     skel = skeletonize(binary)
     if prune > 0:
         skel = prune_skeleton(skel, max_spur=prune)
     print("Tracing skeleton graph...")
-    strokes_raw = extract_all_paths(skel)
+    strokes_raw = extract_all_paths(skel, min_stroke_points=min_stroke_points)
+    if drop_border and strokes_raw:                       # (b) drop frame-hugging strokes
+        h, w = skel.shape
+        strokes_raw = [p for p in strokes_raw if not bbox_hugs_border(p, h, w)]
     if not strokes_raw:
         raise ValueError("no strokes found")
     strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
-    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n)
+    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n,
+                              min_stroke_points=min_stroke_points)
     strokes = enforce_connectivity(strokes)
     strokes = optimize_stroke_order(strokes)
     return build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
@@ -816,7 +855,8 @@ def image_to_trajectory(image_path, mode="auto", max_dim=None,
 
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
-         threshold=None, min_contour_area=50, prune=15, compare=False, debug=False):
+         threshold=None, min_contour_area=50, prune=15, compare=False, debug=False,
+         drop_border=True, min_stroke_points=4):
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
         arr_tmp = np.array(img_tmp)
@@ -830,12 +870,15 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     gray_arr, orig_size = load_and_resize(image_path, max_dim)
     if compare:
         run_comparison(gray_arr, output_path, lineart_threshold=threshold,
-                       min_contour_area=min_contour_area, prune=prune)
+                       min_contour_area=min_contour_area, prune=prune,
+                       drop_border=drop_border, min_stroke_points=min_stroke_points)
         return
     if debug:
         # need binary + skel for debug images; recompute here (debug is CLI-only)
         binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
             else binarize_photo(gray_arr, min_contour_area=min_contour_area)
+        if drop_border:
+            binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
         skel = skeletonize(binary)
         if prune > 0:
             skel = prune_skeleton(skel, max_spur=prune)
@@ -843,7 +886,8 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     plan = image_to_trajectory(image_path, mode=mode, max_dim=max_dim,
                                smooth_sigma=smooth_sigma, simplify_eps=simplify_eps,
                                resample_n=resample_n, threshold=threshold,
-                               min_contour_area=min_contour_area, prune=prune)
+                               min_contour_area=min_contour_area, prune=prune,
+                               drop_border=drop_border, min_stroke_points=min_stroke_points)
     total = sum(len(st["points"]) for st in plan["strokes"])
     print(f"Final: {len(plan['strokes'])} strokes, {total} points")
     write_outputs(plan, output_path)
@@ -885,6 +929,17 @@ Examples:
                         help="Run both modes, side-by-side comparison")
     parser.add_argument("--debug", action="store_true",
                         help="Save intermediate images")
+    border_group = parser.add_mutually_exclusive_group()
+    border_group.add_argument("--drop-border", dest="drop_border", action="store_true",
+                              default=True, help="Drop the canvas-frame skeleton: "
+                              "zero the mask border + drop frame-hugging strokes "
+                              "(default)")
+    border_group.add_argument("--keep-border", dest="drop_border", action="store_false",
+                              help="Keep border-touching skeleton strokes")
+    parser.add_argument("--min-stroke-points", type=int, default=4, dest="min_stroke_points",
+                        help="Drop strokes with fewer than this many points "
+                             "(trivial junction fragments; default 4; lower to 2 to "
+                             "keep tiny features like eyes)")
     return parser.parse_args()
 
 
@@ -903,4 +958,6 @@ if __name__ == "__main__":
         prune=args.prune,
         compare=args.compare,
         debug=args.debug,
+        drop_border=args.drop_border,
+        min_stroke_points=args.min_stroke_points,
     )
