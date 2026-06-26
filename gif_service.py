@@ -25,8 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trajectory_gif import render_gif  # noqa: E402
 
 from image_to_trajectory import image_to_trajectory  # noqa: E402
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                ".import_bundle", "image-to-trajectory", "scripts"))
 from trajectory_prepare import finalize_plan, render_svg, TrajectoryError  # noqa: E402
 
 GIF_MAGIC = b"GIF8"  # matches GIF87a and GIF89a
