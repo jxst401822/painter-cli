@@ -115,8 +115,13 @@ def handle_trace(image_bytes, mode="auto"):
             raise TraceServiceError(f"no strokes found in image: {e}") from e
         except Exception as e:
             raise TraceServiceError(f"trace failed: {e}") from e
-    plan = finalize_plan(plan)          # dedup + stick adhesion + validate (no remap)
-    plan["svg"] = render_svg(plan)      # preview, ±240-native
+    try:
+        plan = finalize_plan(plan)          # dedup + stick adhesion + validate (no remap)
+        plan["svg"] = render_svg(plan)      # preview, ±240-native
+    except TrajectoryError as e:
+        raise TraceServiceError(f"trajectory validation failed: {e}") from e
+    except Exception as e:
+        raise TraceServiceError(f"finalize/svg failed: {e}") from e
     return plan
 
 

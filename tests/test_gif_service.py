@@ -80,3 +80,12 @@ def test_parse_multipart_missing_image_raises():
     body = f"--{boundary}--\r\n".encode()
     with pytest.raises(TraceServiceError):
         parse_multipart(body, boundary)
+
+
+def test_handle_trace_wraps_finalize_error(monkeypatch):
+    import gif_service
+    # image_to_trajectory returns a plan with a 1-point stroke → finalize_plan raises TrajectoryError
+    monkeypatch.setattr(gif_service, "image_to_trajectory",
+                        lambda *a, **k: {"description": "x", "strokes": [{"points": [[0, 0]]}]})
+    with pytest.raises(TraceServiceError):
+        gif_service.handle_trace(_png_bytes(), mode="lineart")
