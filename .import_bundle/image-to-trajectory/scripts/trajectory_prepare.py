@@ -84,6 +84,21 @@ def enforce_stick_adhesion(plan, stick_tol=STICK_TOL):
     return plan
 
 
+def finalize_plan(plan, stick_tol=STICK_TOL):
+    """Guardian for an ALREADY-±240 plan: dedup, enforce stick adhesion, validate.
+    Does NO coordinate mapping (unlike parse_and_map, which maps normalized->±240
+    then calls this)."""
+    strokes = []
+    for i, st in enumerate(plan["strokes"]):
+        pts = dedup_points(st["points"])
+        if len(pts) < 2:
+            raise TrajectoryError(f"stroke {i} has fewer than 2 points after dedup")
+        strokes.append({"points": pts})
+    plan = {"description": plan.get("description", ""), "strokes": strokes}
+    plan = enforce_stick_adhesion(plan, stick_tol=stick_tol)
+    return plan
+
+
 def parse_and_map(raw_json):
     """Validate the model's normalized JSON and map to ±240 integer strokes."""
     cleaned = _strip_code_fences(raw_json)
@@ -111,14 +126,9 @@ def parse_and_map(raw_json):
         if not isinstance(raw_points, list) or not raw_points:
             raise TrajectoryError(f"stroke {i} must contain a non-empty points array")
         pts = [map_point(*_parse_point(p)) for p in raw_points]
-        pts = dedup_points(pts)
-        if len(pts) < 2:
-            raise TrajectoryError(f"stroke {i} has fewer than 2 points after dedup")
         strokes.append({"points": pts})
 
-    plan = {"description": description, "strokes": strokes}
-    plan = enforce_stick_adhesion(plan)
-    return plan
+    return finalize_plan({"description": description, "strokes": strokes})
 
 
 COLORS = [

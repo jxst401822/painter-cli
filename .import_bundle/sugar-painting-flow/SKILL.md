@@ -1,6 +1,6 @@
 ---
 name: sugar-painting-flow
-description: "One-shot sugar-painting flow: text prompt → sugar-painting PNG (dayin.la) → agent vision-traces the PNG into a trajectory JSON → ±240 strokes + SVG preview → animated GIF. All on-device, zero-dependency (system Python 3). Stops at the GIF preview."
+description: "One-shot sugar-painting flow: text prompt → sugar-painting PNG (dayin.la) → POST /trace (deterministic CV) turns the PNG into a trajectory JSON → ±240 strokes + SVG preview → animated GIF. All on-device, zero-dependency (system Python 3). Stops at the GIF preview."
 metadata: {"nanobot":{"emoji":"🍭","requires":{"bins":["python3"]}}}
 ---
 
@@ -10,13 +10,13 @@ End-to-end sugar-painting preview, from a text prompt to an animated GIF:
 generate a sugar-painting image, trace it into a drawing trajectory, render a
 preview SVG, then produce an animated GIF of the drawing process.
 
-This skill **orchestrates** two existing skills and one service — it contains
+This skill **orchestrates** one existing skill and one service — it contains
 no scripts of its own:
 
 - `sugar-painting-gen` — generates the PNG from a text prompt (dayin.la, no auth).
-- `image-to-trajectory` — the agent visually traces the PNG into a trajectory;
-  `trajectory_prepare.py` maps it to the machine's ±240 space + SVG preview.
-- `gif_service` (desktop/cloud HTTP) — turns the ±240 trajectory JSON into a GIF.
+- `gif_service` (desktop/cloud HTTP, same host) — `POST /trace` runs the CV
+  pipeline on the PNG and returns a ±240 trajectory JSON + SVG preview;
+  `POST /render-gif` turns the ±240 trajectory JSON into a GIF.
 
 The device (m310) has no PIL/numpy/opencv and no `curl`. Everything here runs
 on system Python 3 with the standard library only.
@@ -36,12 +36,12 @@ no pip, no numpy, no PIL, no opencv.
 
 ```
 SUGAR_SCRIPTS=/root/update_0508/_quantum-bot/workspace/skills/sugar-painting-gen/scripts
-TRAJ_SCRIPTS=/root/update_0508/_quantum-bot/workspace/skills/image-to-trajectory/scripts
 ```
 
-**GIF service:**
+**Trace + GIF service (same host):**
 
 ```
+TRACE_SERVICE=http://192.168.0.113:8765
 GIF_SERVICE=http://192.168.0.113:8765
 ```
 
@@ -54,13 +54,10 @@ text prompt ("龙")
 ① sugar-painting-gen  →  /tmp/sugar.png        (dayin.la, pure stdlib)
       │
       ▼
-② agent vision-traces PNG  →  /tmp/trace_norm.json   (normalized [0,1])
+② POST /trace  →  /tmp/trace.json + /tmp/trace.svg   (±240, stick-anchor, +svg)
       │
       ▼
-③ trajectory_prepare.py  →  /tmp/trace.json + /tmp/trace.svg   (±240, stick-anchor)
-      │
-      ▼
-④ POST GIF service  →  /tmp/trace.gif          (urllib, no curl)
+③ POST /render-gif  →  /tmp/trace.gif          (urllib, no curl)
       │
       ▼
    report PNG + SVG + GIF to the user
@@ -84,47 +81,54 @@ Note: dayin.la rate-limits (cooldown doubles each use). For batch work, add
 delays. See the `sugar-painting-gen` skill for full prompt tips and the
 dayin.la API reference.
 
-## Step 2: Vision-trace the PNG into a normalized trajectory JSON
+## Step 2: Trace the PNG into a trajectory (POST /trace)
 
-Look at `/tmp/sugar.png`. Trace each visible amber line as a stroke, in the
-order a person would draw it. Output **normalized coordinates** in `[0, 1]`
-where `(0,0)` is the image top-left and `(1,1)` is the bottom-right. Emit
-this exact shape and save it to `/tmp/trace_norm.json`:
+The device cannot run CV (no PIL/numpy/opencv). Upload the PNG to the trace
+service, which runs the CV pipeline on the desktop host and returns a ±240
+trajectory JSON (+ an SVG preview). The device has **no `curl`** — use `urllib`
+with a hand-built multipart body (pure stdlib):
 
-```json
-{
-  "description": "<subject> (<N> strokes)",
-  "strokes": [
-    { "points": [[0.1, 0.5], [0.4, 0.2], [0.6, 0.2], [0.9, 0.5]] }
-  ]
-}
+```python
+import urllib.request, uuid
+
+TRACE_SERVICE = "http://192.168.0.113:8765"   # same host as the GIF service
+
+def post_png(url, png_path):
+    png = open(png_path, "rb").read()
+    boundary = uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n".encode()
+        + b'Content-Disposition: form-data; name="image"; filename="sugar.png"\r\n'
+        + b"Content-Type: image/png\r\n\r\n"
+        + png + b"\r\n"
+        + f"--{boundary}--\r\n".encode()
+    )
+    req = urllib.request.Request(
+        f"{url}/trace", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read().decode("utf-8")  # the ±240 trajectory JSON
+
+import json
+plan = json.loads(post_png(TRACE_SERVICE, "/tmp/sugar.png"))
+open("/tmp/trace.json", "w").write(json.dumps(plan))
+open("/tmp/trace.svg", "w").write(plan["svg"])
+print(f"traced: {len(plan['strokes'])} strokes")
 ```
 
-Rules:
-- `nx, ny` are floats in `[0, 1]`.
-- Each stroke has **≥ 2 points**.
-- Trace **continuous lines**; break at junctions. Eyes/holes are separate closed strokes.
-- Order strokes as you'd draw them; start near the bamboo-stick axis (image left-center) if visible.
-- Approximate is fine — `trajectory_prepare.py` enforces the contract.
-- Aim for 5–25 strokes; >30 is usually too many.
+`/tmp/trace.json` is the machine-ready ±240 trajectory; `/tmp/trace.svg` is the
+preview (returned in the `svg` field — no separate call needed). This replaces
+the previous agent-vision-tracing step with a deterministic CV service call.
 
-See the `image-to-trajectory` skill for the full tracing rule and JSON contract.
+> **Note (was Step 3):** The trajectory is now finalized server-side by `/trace`
+> — the service validates, maps to ±240 (Y flipped: image y-down → machine
+> y-up), enforces stick adhesion, dedups, and returns the SVG preview in the
+> `svg` field. There is no device-side `trajectory_prepare.py` step to run;
+> `/tmp/trace.json` and `/tmp/trace.svg` from Step 2 are already machine-ready.
 
-## Step 3: Prepare the trajectory (validate + map to ±240 + SVG)
-
-Run the stdlib guardian. It validates the normalized JSON, maps to ±240
-(Y flipped: image y-down → machine y-up), enforces stick adhesion (anchors
-to x=0), dedups, and writes an SVG preview:
-
-```bash
-python3 $TRAJ_SCRIPTS/trajectory_prepare.py \
-  /tmp/trace_norm.json /tmp/trace.json --svg /tmp/trace.svg
-```
-
-`/tmp/trace.json` now contains machine-ready ±240 strokes. Open `/tmp/trace.svg`
-in any browser to verify it looks right before proceeding.
-
-## Step 4: Generate the animated GIF
+## Step 3: Generate the animated GIF
 
 The device has **no `curl`**. Call the GIF service over `urllib` (pure stdlib,
 same pattern `sugar-painting-gen` uses for dayin.la):
@@ -132,7 +136,7 @@ same pattern `sugar-painting-gen` uses for dayin.la):
 ```python
 import urllib.request
 
-GIF_SERVICE = "http://192.168.0.113:8765"   # LAN now; swap for a cloud URL later
+GIF_SERVICE = "http://192.168.0.113:8765"   # same host as /trace; swap for a cloud URL later
 plan = open("/tmp/trace.json", "rb").read()
 req = urllib.request.Request(
     f"{GIF_SERVICE}/render-gif",
@@ -149,7 +153,7 @@ except urllib.error.URLError as e:
 ```
 
 `GIF_SERVICE` is a single constant — swap it for a cloud URL later without
-touching anything else. If the service is unreachable, Step 4 is skipped;
+touching anything else. If the service is unreachable, Step 3 is skipped;
 `/tmp/trace.json` + `/tmp/trace.svg` are still delivered.
 
 ## Delivering to the user
@@ -174,8 +178,8 @@ media message.
 ## Error handling
 
 - **dayin.la down / no PNG:** Step 1 fails → stop, tell the user generation failed, retry later.
-- **Bad trajectory JSON:** `trajectory_prepare.py` raises `TrajectoryError` → re-trace (Step 2) with more/fewer strokes.
-- **GIF service unreachable:** Step 4 is skipped (caught above). Still deliver `/tmp/sugar.png` + `/tmp/trace.svg`.
+- **/trace fails (bad PNG / CV error):** the service returns an error → retry Step 1 with a simpler prompt, or re-run Step 2 once the service is healthy.
+- **GIF service unreachable:** Step 3 is skipped (caught above). Still deliver `/tmp/sugar.png` + `/tmp/trace.svg`.
 
 ## End-to-end example ("龙")
 
@@ -184,13 +188,11 @@ media message.
 python3 /root/update_0508/_quantum-bot/workspace/skills/sugar-painting-gen/scripts/sugar_painting_gen.py \
   --prompt "龙" --engine dayinla --output /tmp/sugar.png
 
-# 2. (agent) vision-trace /tmp/sugar.png → /tmp/trace_norm.json
+# 2. POST /tmp/sugar.png to http://192.168.0.113:8765/trace → /tmp/trace.json + /tmp/trace.svg
+#    (urllib multipart upload — see Step 2)
 
-# 3. Prepare trajectory + SVG
-python3 /root/update_0508/_quantum-bot/workspace/skills/image-to-trajectory/scripts/trajectory_prepare.py \
-  /tmp/trace_norm.json /tmp/trace.json --svg /tmp/trace.svg
-
-# 4. (agent) POST /tmp/trace.json to http://192.168.0.113:8765/render-gif → /tmp/trace.gif
+# 3. POST /tmp/trace.json to http://192.168.0.113:8765/render-gif → /tmp/trace.gif
+#    (urllib JSON body — see Step 3)
 ```
 
 Artifacts: `/tmp/sugar.png`, `/tmp/trace.svg`, `/tmp/trace.gif`.

@@ -762,6 +762,45 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 
 # --- Main Pipeline -----------------------------------------------------------
 
+def image_to_trajectory(image_path, mode="auto", max_dim=None,
+                        smooth_sigma=None, simplify_eps=None, resample_n=None,
+                        threshold=None, min_contour_area=50, prune=15):
+    """Run the CV pipeline and return a plan dict ({description, strokes}) WITHOUT writing files.
+
+    This is the library entry point used by gif_service's /trace endpoint.
+    main() wraps this + write_outputs for the CLI.
+    """
+    if mode == "auto":
+        img_tmp = Image.open(image_path).convert("L")
+        arr_tmp = np.array(img_tmp)
+        mode = detect_source_type(arr_tmp)
+        print(f"Auto-detected: {mode}")
+    defaults = MODE_DEFAULTS[mode]
+    max_dim = max_dim or defaults["max_dim"]
+    smooth_sigma = smooth_sigma if smooth_sigma is not None else defaults["sigma"]
+    simplify_eps = simplify_eps if simplify_eps is not None else defaults["eps"]
+    resample_n = resample_n if resample_n is not None else defaults["resample"]
+    gray_arr, orig_size = load_and_resize(image_path, max_dim)
+    print(f"Mode: {mode} | sigma={smooth_sigma} eps={simplify_eps} "
+          f"resample={resample_n} max_dim={max_dim}")
+    print("Binarizing...")
+    binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
+        else binarize_photo(gray_arr, min_contour_area=min_contour_area)
+    print("Skeletonizing...")
+    skel = skeletonize(binary)
+    if prune > 0:
+        skel = prune_skeleton(skel, max_spur=prune)
+    print("Tracing skeleton graph...")
+    strokes_raw = extract_all_paths(skel)
+    if not strokes_raw:
+        raise ValueError("no strokes found")
+    strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
+    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n)
+    strokes = enforce_connectivity(strokes)
+    strokes = optimize_stroke_order(strokes)
+    return build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
+
+
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
          threshold=None, min_contour_area=50, prune=15, compare=False, debug=False):
@@ -777,41 +816,23 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     resample_n = resample_n if resample_n is not None else defaults["resample"]
     gray_arr, orig_size = load_and_resize(image_path, max_dim)
     if compare:
-        run_comparison(gray_arr, output_path, lineart_threshold=threshold, min_contour_area=min_contour_area, prune=prune)
+        run_comparison(gray_arr, output_path, lineart_threshold=threshold,
+                       min_contour_area=min_contour_area, prune=prune)
         return
-    print(f"Mode: {mode} | sigma={smooth_sigma} eps={simplify_eps} "
-          f"resample={resample_n} max_dim={max_dim}")
-    print("Binarizing...")
-    if mode == "lineart":
-        binary = binarize_lineart(gray_arr, threshold=threshold)
-    else:
-        binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
-    print("Skeletonizing...")
-    skel = skeletonize(binary)
-    print(f"Skeleton: {np.count_nonzero(skel)} pixels")
-    if prune > 0:
-        skel = prune_skeleton(skel, max_spur=prune)
-        print(f"Pruned: {np.count_nonzero(skel)} pixels (max_spur={prune})")
     if debug:
+        # need binary + skel for debug images; recompute here (debug is CLI-only)
+        binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
+            else binarize_photo(gray_arr, min_contour_area=min_contour_area)
+        skel = skeletonize(binary)
+        if prune > 0:
+            skel = prune_skeleton(skel, max_spur=prune)
         save_debug_images(binary, skel, output_path)
-    print("Tracing skeleton graph...")
-    strokes_raw = extract_all_paths(skel)
-    print(f"Extracted {len(strokes_raw)} paths")
-    if not strokes_raw:
-        print("No strokes found!"); return
-    print(f"Smoothing (sigma={smooth_sigma})...")
-    strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
-    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n)
-    total = sum(len(st["points"]) for st in strokes)
-    print(f"Before connectivity: {len(strokes)} strokes, {total} points")
-    print("Enforcing connectivity...")
-    strokes = enforce_connectivity(strokes)
-    total = sum(len(st["points"]) for st in strokes)
-    print(f"Optimizing stroke order...")
-    strokes = optimize_stroke_order(strokes)
-    total = sum(len(st["points"]) for st in strokes)
-    print(f"Final: {len(strokes)} strokes, {total} points")
-    plan = build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
+    plan = image_to_trajectory(image_path, mode=mode, max_dim=max_dim,
+                               smooth_sigma=smooth_sigma, simplify_eps=simplify_eps,
+                               resample_n=resample_n, threshold=threshold,
+                               min_contour_area=min_contour_area, prune=prune)
+    total = sum(len(st["points"]) for st in plan["strokes"])
+    print(f"Final: {len(plan['strokes'])} strokes, {total} points")
     write_outputs(plan, output_path)
 
 
