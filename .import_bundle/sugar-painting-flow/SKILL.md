@@ -93,7 +93,7 @@ this exact shape and save it to `/tmp/trace_norm.json`:
 
 ```json
 {
-  "description": "龙 (3 strokes)",
+  "description": "<subject> (<N> strokes)",
   "strokes": [
     { "points": [[0.1, 0.5], [0.4, 0.2], [0.6, 0.2], [0.9, 0.5]] }
   ]
