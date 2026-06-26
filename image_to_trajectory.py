@@ -249,14 +249,17 @@ def prune_skeleton(skel, max_spur=10):
 
 # ─── Path Extraction (DFS with heading-aware traversal) ─────────────────────
 
-def extract_all_paths(skel, min_stroke_points=4):
+def extract_all_paths(skel, min_stroke_points=4, start_from="nearest"):
     """Extract ordered paths from skeleton using DFS traversal.
 
     min_stroke_points: drop paths shorter than this (default 4) so trivial 2-3px
     junction spurs/center fragments don't survive as strokes. trace_from already
-    follows a single curve through junctions (heading-aware); the remaining
-    loop starts nearest an already-traced stroke endpoint to extend existing
-    curves rather than spawning short center fragments."""
+    follows a single curve through junctions (heading-aware).
+    start_from: 'nearest' (default) — the remaining loop starts nearest an
+    already-traced stroke endpoint (extends existing curves, merges collinear
+    long runs; good for filled blobs like love.png). 'center' — starts nearest
+    the image centre (keeps long curves as independent strokes; matches the
+    pre-optimization devon_cat reference structure)."""
     h, w = skel.shape
     fg = set()
     ys, xs = np.where(skel > 0)
@@ -322,9 +325,13 @@ def extract_all_paths(skel, min_stroke_points=4):
     while True:
         remaining = fg - visited
         if not remaining: break
-        # Start nearest an already-traced stroke endpoint (extends existing
-        # curves) instead of the image centre (which spawns short fragments).
-        if all_paths:
+        if start_from == "center":
+            # Old behavior: start nearest the image centre. Keeps long curves as
+            # independent strokes (matches the pre-optimization reference).
+            start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
+        elif all_paths:
+            # Start nearest an already-traced stroke endpoint (extends existing
+            # curves) instead of the image centre (which spawns short fragments).
             endpoints_traced = []
             for p in all_paths:
                 endpoints_traced.append((p[0][1], p[0][0]))    # (y, x) of start
@@ -744,7 +751,7 @@ def _render_panel(draw, strokes, x_offset, sz, label):
 
 
 def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15,
-                         drop_border=True, min_stroke_points=4):
+                         drop_border=True, min_stroke_points=4, start_from="nearest"):
     defaults = MODE_DEFAULTS[mode]
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
@@ -757,7 +764,8 @@ def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, pr
     if prune > 0:
         skel = prune_skeleton(skel, max_spur=prune)
         print(f"  Pruned: {np.count_nonzero(skel)} pixels")
-    paths = extract_all_paths(skel, min_stroke_points=min_stroke_points)
+    paths = extract_all_paths(skel, min_stroke_points=min_stroke_points,
+                              start_from=start_from)
     if drop_border and paths:                             # (b) drop frame-hugging strokes
         h, w = skel.shape
         paths = [p for p in paths if not bbox_hugs_border(p, h, w)]
@@ -772,15 +780,17 @@ def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, pr
 
 
 def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=15,
-                   drop_border=True, min_stroke_points=4):
+                   drop_border=True, min_stroke_points=4, start_from="nearest"):
     from PIL import ImageDraw
     print("\n== Line Art Mode ==")
     strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune,
-                                         drop_border=drop_border, min_stroke_points=min_stroke_points)
+                                         drop_border=drop_border, min_stroke_points=min_stroke_points,
+                                         start_from=start_from)
     plan_la = build_plan(strokes_la, "Line art mode")
     print("\n== Photo Mode ==")
     strokes_ph, _ = _run_single_pipeline(gray_arr, "photo", min_contour_area=min_contour_area, prune=prune,
-                                         drop_border=drop_border, min_stroke_points=min_stroke_points)
+                                         drop_border=drop_border, min_stroke_points=min_stroke_points,
+                                         start_from=start_from)
     plan_ph = build_plan(strokes_ph, "Photo mode")
     base = output_path.replace('.json', '')
     write_outputs(plan_la, f"{base}_lineart.json")
@@ -806,7 +816,7 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 def image_to_trajectory(image_path, mode="auto", max_dim=None,
                         smooth_sigma=None, simplify_eps=None, resample_n=None,
                         threshold=None, min_contour_area=50, prune=15,
-                        drop_border=True, min_stroke_points=4):
+                        drop_border=True, min_stroke_points=4, start_from="nearest"):
     """Run the CV pipeline and return a plan dict ({description, strokes}) WITHOUT writing files.
 
     This is the library entry point used by gif_service's /trace endpoint.
@@ -839,7 +849,8 @@ def image_to_trajectory(image_path, mode="auto", max_dim=None,
     if prune > 0:
         skel = prune_skeleton(skel, max_spur=prune)
     print("Tracing skeleton graph...")
-    strokes_raw = extract_all_paths(skel, min_stroke_points=min_stroke_points)
+    strokes_raw = extract_all_paths(skel, min_stroke_points=min_stroke_points,
+                                    start_from=start_from)
     if drop_border and strokes_raw:                       # (b) drop frame-hugging strokes
         h, w = skel.shape
         strokes_raw = [p for p in strokes_raw if not bbox_hugs_border(p, h, w)]
@@ -856,7 +867,7 @@ def image_to_trajectory(image_path, mode="auto", max_dim=None,
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
          threshold=None, min_contour_area=50, prune=15, compare=False, debug=False,
-         drop_border=True, min_stroke_points=4):
+         drop_border=True, min_stroke_points=4, start_from="nearest"):
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
         arr_tmp = np.array(img_tmp)
@@ -871,7 +882,8 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     if compare:
         run_comparison(gray_arr, output_path, lineart_threshold=threshold,
                        min_contour_area=min_contour_area, prune=prune,
-                       drop_border=drop_border, min_stroke_points=min_stroke_points)
+                       drop_border=drop_border, min_stroke_points=min_stroke_points,
+                       start_from=start_from)
         return
     if debug:
         # need binary + skel for debug images; recompute here (debug is CLI-only)
@@ -887,7 +899,8 @@ def main(image_path, output_path, mode="auto", max_dim=None,
                                smooth_sigma=smooth_sigma, simplify_eps=simplify_eps,
                                resample_n=resample_n, threshold=threshold,
                                min_contour_area=min_contour_area, prune=prune,
-                               drop_border=drop_border, min_stroke_points=min_stroke_points)
+                               drop_border=drop_border, min_stroke_points=min_stroke_points,
+                               start_from=start_from)
     total = sum(len(st["points"]) for st in plan["strokes"])
     print(f"Final: {len(plan['strokes'])} strokes, {total} points")
     write_outputs(plan, output_path)
@@ -940,6 +953,11 @@ Examples:
                         help="Drop strokes with fewer than this many points "
                              "(trivial junction fragments; default 4; lower to 2 to "
                              "keep tiny features like eyes)")
+    parser.add_argument("--start-from", choices=["nearest", "center"], default="nearest",
+                        dest="start_from", help="Remaining-skeleton start point: 'nearest' "
+                        "extends traced curves (merges collinear long runs; default, good "
+                        "for filled blobs); 'center' keeps long curves as independent "
+                        "strokes (matches the pre-optimization reference structure)")
     return parser.parse_args()
 
 
@@ -960,4 +978,5 @@ if __name__ == "__main__":
         debug=args.debug,
         drop_border=args.drop_border,
         min_stroke_points=args.min_stroke_points,
+        start_from=args.start_from,
     )
