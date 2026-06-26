@@ -4,6 +4,7 @@ import pytest
 from trajectory_prepare import parse_and_map, map_point, TrajectoryError
 from trajectory_prepare import enforce_stick_adhesion, STICK_TOL
 from trajectory_prepare import render_svg
+from trajectory_prepare import finalize_plan
 
 
 def test_map_point_corners():
@@ -97,3 +98,33 @@ def test_render_svg_is_valid_xml():
     plan = _plan([[[0, 0], [240, 240]]])
     svg = render_svg(plan)
     ET.fromstring(svg)  # raises if not well-formed
+
+
+def test_finalize_plan_dedups_and_keeps_anchored():
+    # already ±240, already crosses x=0 → adhesion no-op, dedup removes dup
+    plan = {"description": "x", "strokes": [{"points": [[0, 0], [10, 10], [10, 10], [20, 20]]}]}
+    out = finalize_plan(plan)
+    assert out["strokes"][0]["points"] == [[0, 0], [10, 10], [20, 20]]
+
+
+def test_finalize_plan_anchors_when_no_stick_crossing():
+    plan = {"description": "x", "strokes": [{"points": [[40, 5], [80, 50]]}]}
+    out = finalize_plan(plan)
+    # nearest point to x=0 is [40,5] → anchor [0,5] prepended
+    assert out["strokes"][0]["points"][0] == [0, 5]
+
+
+def test_finalize_plan_rejects_short_stroke():
+    plan = {"description": "x", "strokes": [{"points": [[40, 5]]}]}
+    with pytest.raises(TrajectoryError):
+        finalize_plan(plan)
+
+
+def test_finalize_plan_does_not_remap_coordinates():
+    # ±240 values must pass through unchanged (no [0,1] mapping applied)
+    plan = {"description": "x", "strokes": [{"points": [[0, -240], [240, 240]]}]}
+    out = finalize_plan(plan)
+    pts = out["strokes"][0]["points"]
+    # anchored already (x=0 present), so no prepend; values intact
+    assert [240, 240] in pts
+    assert [0, -240] in pts
