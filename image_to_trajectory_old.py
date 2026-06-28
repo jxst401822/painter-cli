@@ -648,28 +648,76 @@ def optimize_stroke_order(strokes):
     return [{"points": s["points"]} for s in ordered]
 
 
-# --- Connectivity Enforcement ------------------------------------------------
+# --- Connectivity Enforcement (Sugar-Painting Optimized) --------------------
 
-def enforce_connectivity(strokes, connect_threshold=15):
+def _nearest_endpoint_pair(strokes, idx_a, idx_b):
+    """Find the closest pair of endpoints between two strokes.
+    Returns (dist, endpoint_a_idx, endpoint_b_idx, reverse_b).
+    endpoint_a_idx: 0=start, -1=end of stroke A.
+    """
+    pa = strokes[idx_a]["points"]
+    pb = strokes[idx_b]["points"]
+    endpoints_a = [(np.array(pa[0]), 0), (np.array(pa[-1]), -1)]
+    endpoints_b = [(np.array(pb[0]), 0), (np.array(pb[-1]), -1)]
+    best_dist = float('inf')
+    best_a = best_b = 0
+    best_rev = False
+    for ea, ai in endpoints_a:
+        for eb, bi in endpoints_b:
+            d = np.linalg.norm(ea - eb)
+            if d < best_dist:
+                best_dist = d
+                best_a = ai
+                best_b = bi
+                best_rev = (bi == 0)
+    return best_dist, best_a, best_b, best_rev
+
+
+def _extend_stroke_to_meet(strokes, idx_from, endpoint_from, idx_to, endpoint_to):
+    """Extend stroke[idx_from] endpoint to meet stroke[idx_to] endpoint.
+
+    Instead of a separate bridge line, we insert intermediate points into the
+    from-stroke so it physically reaches the to-stroke's endpoint.
+    """
+    pa = strokes[idx_from]["points"]
+    pb = strokes[idx_to]["points"]
+    src = np.array(pa[-1 if endpoint_from == -1 else 0])
+    dst = np.array(pb[-1 if endpoint_to == -1 else 0])
+
+    dist = float(np.linalg.norm(src - dst))
+
+    if dist <= 5:
+        bridge_pts = [dst.tolist()]
+    else:
+        mid = (src + dst) / 2
+        bridge_pts = [mid.tolist(), dst.tolist()]
+
+    if endpoint_from == -1:
+        strokes[idx_from]["points"] = pa + bridge_pts
+    else:
+        strokes[idx_from]["points"] = bridge_pts + pa
+
+    return dist
+
+
+def enforce_connectivity(strokes, connect_threshold=30):
+    """Connect disconnected components by extending stroke endpoints.
+
+    Instead of adding separate 2-point bridge strokes, we extend the nearest
+    endpoint of one stroke to physically reach the nearest endpoint of another
+    stroke. This produces smoother, more natural sugar-painting paths.
+    """
     if not strokes:
         return strokes
-    bridges = []
-    max_iterations = 20
+
+    n = len(strokes)
+    STICK_TOL = 2
+    MAX_EXTEND = 40
+    max_iterations = 5
+    extended_strokes = set()
+
     for iteration in range(max_iterations):
         n = len(strokes)
-        connected = [[False]*n for _ in range(n)]
-        for i in range(n):
-            connected[i][i] = True
-            pi = np.array(strokes[i]["points"])
-            for j in range(i+1, n):
-                pj = np.array(strokes[j]["points"])
-                min_dist = float('inf')
-                for p in pi:
-                    for q in pj:
-                        d = abs(p[0]-q[0]) + abs(p[1]-q[1])
-                        if d < min_dist: min_dist = d
-                if min_dist <= connect_threshold:
-                    connected[i][j] = True; connected[j][i] = True
         parent = list(range(n))
         def find(x):
             while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
@@ -677,43 +725,65 @@ def enforce_connectivity(strokes, connect_threshold=15):
         def union(a, b):
             a, b = find(a), find(b)
             if a != b: parent[b] = a
+
         for i in range(n):
             for j in range(i+1, n):
-                if connected[i][j]: union(i, j)
+                d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
+                if d <= connect_threshold:
+                    union(i, j)
+
         components = {}
         for i in range(n):
             root = find(i)
             components.setdefault(root, []).append(i)
+
         if len(components) == 1:
-            print(f"  All {n} strokes connected (threshold={connect_threshold})")
+            print(f"  All {n} strokes connected")
             break
+
         main_root = max(components, key=lambda r: len(components[r]))
         main_indices = set(components[main_root])
-        print(f"  Iteration {iteration+1}: {len(components)} components, adding bridges...")
-        new_bridges = []
+        print(f"  Iteration {iteration+1}: {len(components)} components, extending endpoints...")
+
+        extensions = 0
         for root, indices in components.items():
             if root == main_root: continue
-            best_dist = float('inf'); best_from = best_to = None
+            best_dist = float('inf')
+            best_i = best_j = None
+            best_ep_a = best_ep_b = None
+            best_rev = False
+
             for i in indices:
-                pi = np.array(strokes[i]["points"])
+                if i in extended_strokes:
+                    continue
                 for j in main_indices:
-                    pj = np.array(strokes[j]["points"])
-                    for p in pi:
-                        for q in pj:
-                            d = abs(p[0]-q[0]) + abs(p[1]-q[1])
-                            if d < best_dist:
-                                best_dist = d
-                                best_from = [int(p[0]), int(p[1])]
-                                best_to = [int(q[0]), int(q[1])]
-            if best_from and best_to:
-                bridge = {"points": [best_from, best_to]}
-                new_bridges.append(bridge); bridges.append(bridge)
-                print(f"    Bridge: {best_from} -> {best_to} (dist={best_dist:.0f})")
+                    d, ep_a, ep_b, rev = _nearest_endpoint_pair(strokes, i, j)
+                    if d < best_dist:
+                        best_dist = d
+                        best_i, best_j = i, j
+                        best_ep_a, best_ep_b = ep_a, ep_b
+                        best_rev = rev
+
+            if best_i is not None and best_dist <= MAX_EXTEND:
+                dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
+                                               best_j, best_ep_b)
+                extensions += 1
+                extended_strokes.add(best_i)
                 main_indices.update(indices)
-        if not new_bridges: break
-        strokes = strokes + new_bridges
+                print(f"    Extended stroke {best_i} -> {best_j} (dist={dist:.0f})")
+            else:
+                print(f"    Skipped orphan (dist={best_dist:.0f} > {MAX_EXTEND})")
+
+        if extensions == 0:
+            break
+
+        if extensions == 0:
+            break
+
+    _connect_remaining_orphans(strokes)
+
     touches_stick = any(
-        any(abs(p[0]) <= 2 for p in st["points"]) for st in strokes
+        any(abs(p[0]) <= STICK_TOL for p in st["points"]) for st in strokes
     )
     if not touches_stick:
         best_stroke = 0; best_dist = float('inf'); best_point = None
@@ -727,8 +797,184 @@ def enforce_connectivity(strokes, connect_threshold=15):
         print(f"  Stick root added: {anchor}")
     else:
         print(f"  Stick adhesion: OK")
-    if bridges:
-        print(f"  Total bridges added: {len(bridges)}")
+
+    return strokes
+
+
+def _connect_remaining_orphans(strokes):
+    """Connect or remove orphan strokes after main connectivity loop.
+
+    Strokes whose nearest endpoint is within 80px of another stroke's
+    endpoint are connected. Others are removed (too far for sugar painting).
+    """
+    if len(strokes) <= 1:
+        return
+
+    n = len(strokes)
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b: parent[b] = a
+
+    for i in range(n):
+        for j in range(i+1, n):
+            d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
+            if d <= 30:
+                union(i, j)
+
+    components = {}
+    for i in range(n):
+        root = find(i)
+        components.setdefault(root, []).append(i)
+
+    if len(components) == 1:
+        return
+
+    main_root = max(components, key=lambda r: len(components[r]))
+    print(f"  Processing {len(components)-1} orphan components...")
+
+    removed_orphans = set()
+    for root, indices in components.items():
+        if root == main_root:
+            continue
+
+        best_dist = float('inf')
+        best_i = best_j = None
+        best_ep_a = best_ep_b = None
+
+        for i in indices:
+            for j in range(n):
+                if j in indices:
+                    continue
+                d, ep_a, ep_b, _ = _nearest_endpoint_pair(strokes, i, j)
+                if d < best_dist:
+                    best_dist = d
+                    best_i, best_j = i, j
+                    best_ep_a, best_ep_b = ep_a, ep_b
+
+        if best_i is not None and best_dist <= 80:
+            dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
+                                           best_j, best_ep_b)
+            for idx in indices:
+                parent[find(idx)] = main_root
+            print(f"    Connected orphan stroke {best_i} -> {best_j} (dist={dist:.0f})")
+        else:
+            for idx in indices:
+                removed_orphans.add(idx)
+            print(f"    Removed far orphan ({len(indices)} strokes, dist={best_dist:.0f})")
+
+    if removed_orphans:
+        strokes[:] = [s for i, s in enumerate(strokes) if i not in removed_orphans]
+        print(f"  After orphan cleanup: {len(strokes)} strokes")
+
+
+def merge_short_strokes(strokes, min_pts=2, min_size=10, max_merge_dist=50, max_total_length=50,
+                         max_aspect_ratio=8.0):
+    """Absorb short or tiny strokes into neighboring strokes.
+
+    A stroke is considered 'mergeable' if:
+      - it has <= min_pts points, OR
+      - its bounding box is smaller than min_size in BOTH dimensions, OR
+      - its total path length < max_total_length (short arc)
+
+    A stroke is considered 'junk' (removed without merge) if:
+      - it has extreme aspect ratio (> max_aspect_ratio) AND is small (bbox area < 2000)
+
+    Only merges if the nearest endpoint is within max_merge_dist pixels.
+    """
+    if len(strokes) <= 1:
+        return strokes
+
+    def total_length(pts):
+        arr = np.array(pts)
+        return float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1)))
+
+    def is_mergeable(s):
+        pts = np.array(s["points"])
+        if len(pts) <= min_pts:
+            return True
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        if w < min_size and h < min_size:
+            return True
+        if total_length(s["points"]) < max_total_length:
+            return True
+        return False
+
+    def is_junk(s):
+        pts = np.array(s["points"])
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        area = (w + 1) * (h + 1)
+        if area > 2000:
+            return False
+        aspect = max(w, h) / max(min(w, h), 1)
+        return aspect > max_aspect_ratio
+
+    mergeable = [i for i, s in enumerate(strokes) if is_mergeable(s)]
+    if not mergeable:
+        return strokes
+
+    removed = set()
+    for si in mergeable:
+        if si in removed:
+            continue
+        s_pts = strokes[si]["points"]
+        s_start = np.array(s_pts[0])
+        s_end = np.array(s_pts[-1])
+        s_mid = (s_start + s_end) / 2
+
+        best_dist = float('inf')
+        best_li = None
+        best_lep = None
+
+        for li, ls in enumerate(strokes):
+            if li == si or li in removed:
+                continue
+            l_pts = ls["points"]
+            for ep_idx, ep in [(0, np.array(l_pts[0])), (-1, np.array(l_pts[-1]))]:
+                for sep in [s_start, s_end]:
+                    d = np.linalg.norm(ep - sep)
+                    if d < best_dist:
+                        best_dist = d
+                        best_li = li
+                        best_lep = ep_idx
+
+        if best_li is not None and best_dist <= max_merge_dist:
+            target = strokes[best_li]
+            t_pts = target["points"]
+            t_ep = np.array(t_pts[-1 if best_lep == -1 else 0])
+            mid = ((t_ep + s_mid) / 2).tolist()
+            if best_lep == -1:
+                target["points"] = t_pts + [mid] + s_pts
+            else:
+                target["points"] = s_pts + [mid] + t_pts
+            removed.add(si)
+            print(f"  Merged stroke {si} ({len(s_pts)}pts) into {best_li} (dist={best_dist:.0f})")
+
+    if removed:
+        strokes = [s for i, s in enumerate(strokes) if i not in removed]
+        print(f"  After merge: {len(strokes)} strokes")
+
+    removed2 = set()
+    for i, s in enumerate(strokes):
+        pts = np.array(s["points"])
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        is_tiny = (w < min_size and h < min_size) or length < max_total_length
+        if is_tiny or is_junk(s):
+            removed2.add(i)
+            reason = "junk" if is_junk(s) else "tiny"
+            print(f"  Removed orphan {reason} stroke {i} ({len(pts)}pts, {w:.0f}x{h:.0f}, len={length:.0f})")
+
+    if removed2:
+        strokes = [s for i, s in enumerate(strokes) if i not in removed2]
+        print(f"  After orphan removal: {len(strokes)} strokes")
+
     return strokes
 
 
@@ -834,6 +1080,7 @@ def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, pr
     smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in all_strokes]
     strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"])
     strokes = enforce_connectivity(strokes)
+    strokes = merge_short_strokes(strokes)
     strokes = optimize_stroke_order(strokes)
     return strokes, defaults
 
@@ -923,6 +1170,9 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     print(f"Before connectivity: {len(strokes)} strokes, {total} points")
     print("Enforcing connectivity...")
     strokes = enforce_connectivity(strokes, connect_threshold=15)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Merging short strokes...")
+    strokes = merge_short_strokes(strokes)
     total = sum(len(st["points"]) for st in strokes)
     print(f"Optimizing stroke order...")
     strokes = optimize_stroke_order(strokes)
