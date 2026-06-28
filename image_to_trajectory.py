@@ -25,7 +25,7 @@ except ImportError:
 
 MODE_DEFAULTS = {
     "lineart": {
-        "sigma": 4.0, "eps": 1.5, "max_dim": 200,
+        "sigma": 4.0, "eps": 0.8, "max_dim": 200,
         "resample": 100, "threshold": None,
     },
     "photo": {
@@ -249,17 +249,16 @@ def prune_skeleton(skel, max_spur=10):
 
 # ─── Path Extraction (DFS with heading-aware traversal) ─────────────────────
 
-def extract_all_paths(skel, min_stroke_points=4, start_from="nearest"):
+def extract_all_paths(skel, min_stroke_points=2, start_from="center"):
     """Extract ordered paths from skeleton using DFS traversal.
 
-    min_stroke_points: drop paths shorter than this (default 4) so trivial 2-3px
-    junction spurs/center fragments don't survive as strokes. trace_from already
-    follows a single curve through junctions (heading-aware).
-    start_from: 'nearest' (default) — the remaining loop starts nearest an
-    already-traced stroke endpoint (extends existing curves, merges collinear
-    long runs; good for filled blobs like love.png). 'center' — starts nearest
-    the image centre (keeps long curves as independent strokes; matches the
-    pre-optimization devon_cat reference structure)."""
+    min_stroke_points: drop paths shorter than this (default 2) so 1px noise drops
+    but short features (whiskers, ear tips) survive. trace_from already follows a
+    single curve through junctions (heading-aware).
+    start_from: 'center' (default) — starts nearest the image centre (keeps long
+    curves as independent strokes; replicates the old version's detail-preserving
+    structure). 'nearest' — starts nearest an already-traced stroke endpoint
+    (extends/merges collinear long runs; use for filled blobs like love.png)."""
     h, w = skel.shape
     fg = set()
     ys, xs = np.where(skel > 0)
@@ -403,7 +402,7 @@ def douglas_peucker(pts, eps):
 
 # ─── Coordinate Scaling ────────────────────────────────────────────────────
 
-def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=4):
+def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=2):
     """Scale paths to ±240 canvas, simplify, resample. Drops strokes with fewer
     than min_stroke_points points after dedup (trivial fragments)."""
     all_pts = np.vstack(strokes_raw)
@@ -751,7 +750,7 @@ def _render_panel(draw, strokes, x_offset, sz, label):
 
 
 def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15,
-                         drop_border=True, min_stroke_points=4, start_from="nearest"):
+                         drop_border=True, min_stroke_points=2, start_from="center"):
     defaults = MODE_DEFAULTS[mode]
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
@@ -780,7 +779,7 @@ def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, pr
 
 
 def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=15,
-                   drop_border=True, min_stroke_points=4, start_from="nearest"):
+                   drop_border=True, min_stroke_points=2, start_from="center"):
     from PIL import ImageDraw
     print("\n== Line Art Mode ==")
     strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune,
@@ -816,7 +815,7 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 def image_to_trajectory(image_path, mode="auto", max_dim=None,
                         smooth_sigma=None, simplify_eps=None, resample_n=None,
                         threshold=None, min_contour_area=50, prune=15,
-                        drop_border=True, min_stroke_points=4, start_from="nearest"):
+                        drop_border=True, min_stroke_points=2, start_from="center"):
     """Run the CV pipeline and return a plan dict ({description, strokes}) WITHOUT writing files.
 
     This is the library entry point used by gif_service's /trace endpoint.
@@ -867,7 +866,7 @@ def image_to_trajectory(image_path, mode="auto", max_dim=None,
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
          threshold=None, min_contour_area=50, prune=15, compare=False, debug=False,
-         drop_border=True, min_stroke_points=4, start_from="nearest"):
+         drop_border=True, min_stroke_points=2, start_from="center"):
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
         arr_tmp = np.array(img_tmp)
@@ -949,15 +948,15 @@ Examples:
                               "(default)")
     border_group.add_argument("--keep-border", dest="drop_border", action="store_false",
                               help="Keep border-touching skeleton strokes")
-    parser.add_argument("--min-stroke-points", type=int, default=4, dest="min_stroke_points",
+    parser.add_argument("--min-stroke-points", type=int, default=2, dest="min_stroke_points",
                         help="Drop strokes with fewer than this many points "
-                             "(trivial junction fragments; default 4; lower to 2 to "
-                             "keep tiny features like eyes)")
-    parser.add_argument("--start-from", choices=["nearest", "center"], default="nearest",
-                        dest="start_from", help="Remaining-skeleton start point: 'nearest' "
-                        "extends traced curves (merges collinear long runs; default, good "
-                        "for filled blobs); 'center' keeps long curves as independent "
-                        "strokes (matches the pre-optimization reference structure)")
+                             "(default 2 keeps short features like whiskers/eyes; raise to 4 "
+                             "to drop trivial junction fragments)")
+    parser.add_argument("--start-from", choices=["nearest", "center"], default="center",
+                        dest="start_from", help="Remaining-skeleton start point: 'center' "
+                        "(default) keeps long curves as independent strokes (detail-preserving, "
+                        "matches the old version); 'nearest' extends/merges collinear long runs "
+                        "(use for filled blobs like love.png)")
     return parser.parse_args()
 
 
