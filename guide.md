@@ -1,3 +1,21 @@
+这种现象（面部五官、胡须、爪子细节全部丢失）是由原本代码中几个**核心算法参数过于激进**以及**缺乏对实体填充区域（如猫眼）的轮廓保护**导致的。
+
+### 🔍 核心问题分析
+
+1. **过度的骨架剪枝 (`max_spur=15`)**
+原本默认执行 15 次剪枝。在每一步剪枝中，所有端点都会被剥离。像胡须、脚趾这种一端或两端悬空的短线段，只要长度小于 30 像素，就会在 15 次循环中被**彻底擦除**。
+2. **分辨率过低 (`max_dim=200`) 与平滑过度 (`sigma=4.0`)**
+将图像强行压缩到 200px 后，细节本就模糊。再配合高强度的高斯平滑（$\sigma=4.0$ 的窗口半径接近 12 像素），直接将胡须和脚部的小转角融化掉了。
+3. **实体填充坍塌（眼睛丢失）**
+猫眼在原图中是**实心填充**的圆形。张苏恩（Zhang-Suen）骨架提取算法在处理实心圆时，会将其收缩为一个点或一条极短的线，随后在剪枝阶段被当成噪声直接干掉。对于糖画而言，实心区域应当被转化为**空心轮廓线条**来绘制。
+
+---
+
+### 🛠️ 优化后的完整代码
+
+我在代码中引入了**基于距离变换（Distance Transform）的厚度自适应空心化函数 `hollow_thick_blobs**`。它能自动识别出比普通线条厚的实体区域（如眼睛），将其精准转化为中空的闭合轮廓，同时调优了整体分辨率与平滑参数：
+
+```python
 """
 Enhanced image-to-trajectory pipeline for sugar painting.
 
@@ -22,15 +40,23 @@ except ImportError:
     HAS_CV2 = False
 
 # ─── Mode-specific default parameters ───────────────────────────────────────
-
+# Optimized resolutions and smoothed window ratios to preserve fine details
 MODE_DEFAULTS = {
     "lineart": {
-        "sigma": 2.0, "eps": 1.0, "max_dim": 400,
-        "resample": 150, "threshold": None,
+        "sigma": 1.2,      # Reduced to keep sharp transitions and whiskers
+        "eps": 0.6,        # Precision threshold for Douglas-Peucker
+        "max_dim": 500,    # Increased resolution to capture small features
+        "resample": 150, 
+        "threshold": None,
+        "prune": 2,        # Safe lower value for clean digital art
     },
     "photo": {
-        "sigma": 6.0, "eps": 2.5, "max_dim": 250,
-        "resample": 120, "threshold": None,
+        "sigma": 2.0, 
+        "eps": 1.0, 
+        "max_dim": 500,
+        "resample": 150, 
+        "threshold": None,
+        "prune": 4,
     },
 }
 
@@ -79,35 +105,20 @@ def detect_source_type(gray_arr):
     return mode
 
 
-def is_dark_background(gray_arr):
-    """Detect if image has a dark background (lines are lighter than background)."""
-    return float(np.mean(gray_arr)) < 128
-
-
 # ─── Binarization: Line Art Mode ────────────────────────────────────────────
 
-def binarize_lineart(gray_arr, threshold=None, invert=None):
-    """Otsu auto-threshold (or manual) — minimal pre-processing to preserve thin lines.
-
-    invert: None = auto-detect dark background, True = force invert, False = no invert
-    """
+def binarize_lineart(gray_arr, threshold=None):
+    """Otsu auto-threshold (or manual) + Gaussian blur + morph open."""
     img = gray_arr.copy()
 
-    if invert is None:
-        invert = is_dark_background(gray_arr)
-        if invert:
-            print("  Dark background detected — inverting")
-
-    if invert:
-        img = 255 - img
-
     if HAS_CV2:
+        img = cv2.GaussianBlur(img, (3, 3), 0)
         if threshold is not None:
-            _, binary = cv2.threshold(img, threshold, 255,
-                                       cv2.THRESH_BINARY_INV)
+            _, binary = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY_INV)
         else:
-            _, binary = cv2.threshold(img, 0, 255,
-                                       cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     else:
         if threshold is None:
             threshold = 150
@@ -126,32 +137,26 @@ def binarize_photo(gray_arr, min_contour_area=50):
         print("  ERROR: Photo mode requires opencv-python (cv2)")
         return binarize_lineart(gray_arr)
 
-    # 1. Sharpen — unsharp mask to enhance edges before detection
     blurred = cv2.GaussianBlur(gray_arr, (0, 0), 3)
     sharpened = cv2.addWeighted(gray_arr, 2.0, blurred, -1.0, 0)
     sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
 
-    # 1b. CLAHE — contrast enhancement for facial features in low-contrast images
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     sharpened = clahe.apply(sharpened)
 
-    # 2. Bilateral filter (2 passes) — edge-preserving denoising
     filtered = cv2.bilateralFilter(sharpened, d=9, sigmaColor=75, sigmaSpace=75)
     filtered = cv2.bilateralFilter(filtered, d=9, sigmaColor=75, sigmaSpace=75)
 
-    # 3. Adaptive threshold — handles uneven lighting
     adaptive = cv2.adaptiveThreshold(
         filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, blockSize=15, C=3
     )
 
-    # 4. Canny edge detection — auto-tuned thresholds
     median = np.median(filtered.astype(np.float64))
     low = max(0, int(median * 0.5))
     high = min(255, int(median * 1.5))
     canny = cv2.Canny(filtered, low, high)
 
-    # 5. Morphological cleanup on Canny
     kernel_close = np.ones((3, 3), np.uint8)
     canny = cv2.morphologyEx(canny, cv2.MORPH_CLOSE, kernel_close, iterations=1)
 
@@ -161,186 +166,54 @@ def binarize_photo(gray_arr, min_contour_area=50):
     kernel_dilate = np.ones((2, 2), np.uint8)
     canny = cv2.dilate(canny, kernel_dilate, iterations=1)
 
-    # 6. Merge adaptive + Canny
     merged = cv2.bitwise_or(adaptive, canny)
 
-    # 7. Remove small noise contours (keep only significant edges)
     contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         if cv2.contourArea(cnt) < min_contour_area:
             cv2.drawContours(merged, [cnt], -1, 0, -1)
 
-    # 8. Final morphological close to bridge small gaps
     kernel_final = np.ones((3, 3), np.uint8)
     merged = cv2.morphologyEx(merged, cv2.MORPH_CLOSE, kernel_final, iterations=2)
 
-    # Convert to 0/1
     result = (merged > 0).astype(np.uint8)
     print(f"  Photo edge pixels: {np.count_nonzero(result)}")
     return result
 
 
-# ─── Thin Feature (Whisker) Extraction ─────────────────────────────────────
+# ─── Feature Preservation Layer ─────────────────────────────────────────────
 
-def extract_thin_features(binary, min_length=10, aspect_ratio_min=3.0, thin_width=4):
-    """Detect thin elongated features (whiskers, thin lines) directly from binary.
-
-    These features often get lost during skeletonization because they're only
-    1-3px wide and may not survive Zhang-Suen thinning well.
-
-    Returns (thin_strokes, cleaned_binary) where thin_strokes are path arrays
-    and cleaned_binary has the thin features removed.
+def hollow_thick_blobs(binary, max_line_thickness=3.5):
+    """
+    Finds regions in the binary mask that are thicker than typical lines (like filled eyes)
+    and hollows them out into outlines so skeletonization preserves their shape as loops.
     """
     if not HAS_CV2:
-        return [], binary.copy()
-
-    cleaned = binary.copy()
-    thin_strokes = []
-
-    # Create mask of thin pixels (distance from edge < thin_width)
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    thin_mask = ((dist > 0) & (dist <= thin_width)).astype(np.uint8) * 255
-
-    # Also include pixels that are on thin lines (skeleton-like)
-    # Use morphological gradient to find edges of thin structures
-    kernel = np.ones((3, 3), np.uint8)
-    eroded = cv2.erode(binary, kernel, iterations=1)
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-    gradient = cv2.subtract(dilated, eroded)
-    thin_mask = cv2.bitwise_or(thin_mask, gradient)
-
-    # Clean up thin mask
-    thin_mask = cv2.morphologyEx(thin_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # Find connected components in thin mask
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        thin_mask, connectivity=8
-    )
-
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-
-        # Calculate aspect ratio
-        if min(w, h) == 0:
-            continue
-        ar = max(w, h) / min(w, h)
-
-        # Check if this is an elongated thin feature
-        if ar >= aspect_ratio_min and max(w, h) >= min_length:
-            # Extract path from this component's pixels
-            component_mask = (labels == i).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(
-                component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if not contours:
-                continue
-
-            cnt = max(contours, key=cv2.contourArea)
-            # Simplify contour to get a clean path
-            epsilon = 0.02 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon)
-
-            pts = approx.squeeze()
-            if pts.ndim != 2 or len(pts) < 3:
-                continue
-
-            pts = pts.astype(np.float64)
-            thin_strokes.append(pts)
-            # Remove from binary to avoid duplicate skeleton strokes
-            cleaned[labels == i] = 0
-            print(f"    Thin feature #{i}: {w}x{h}, ar={ar:.1f}, area={area} → stroke")
-
-    return thin_strokes, cleaned
-
-def extract_filled_regions(binary, min_area=30, max_area=800, roundness_thresh=0.5):
-    """Detect small filled components (e.g. cat eyes) and extract their contours.
-
-    Returns (contour_strokes, cleaned_binary) where contour_strokes is a list of
-    Nx2 numpy arrays (closed contours) and cleaned_binary has the filled regions
-    removed so skeletonize doesn't create noise.
-    """
-    if not HAS_CV2:
-        return [], binary.copy()
-
-    cleaned = binary.copy()
-    contour_strokes = []
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-
-    for i in range(1, num_labels):  # skip background
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_area or area > max_area:
-            continue
-
-        mask = (labels == i).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-
-        cnt = max(contours, key=cv2.contourArea)
-        peri = cv2.arcLength(cnt, True)
-        if peri < 1e-6:
-            continue
-        circularity = 4 * np.pi * area / (peri * peri)
-
-        if circularity >= roundness_thresh:
-            pts = cnt.squeeze()
-            if pts.ndim != 2:
-                continue
-            pts = pts.astype(np.float64)
-            # Close the contour
-            pts = np.vstack([pts, pts[0:1]])
-            contour_strokes.append(pts)
-            cleaned[labels == i] = 0
-            print(f"    Filled region #{i}: area={area}, circularity={circularity:.2f} → contour stroke")
-
-    return contour_strokes, cleaned
-
-
-# ─── Adaptive Pruning (length-aware) ──────────────────────────────────────
-
-def prune_skeleton_adaptive(skel, max_spur=5, min_component_pixels=15):
-    """Remove short dead-end branches, but preserve small independent components.
-
-    Before pruning, identify connected components smaller than min_component_pixels.
-    These are likely features like whisker tips or small details — skip pruning on them.
-    """
-    img = skel.copy()
-    h, w = img.shape
-
-    if HAS_CV2:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img, connectivity=8)
-        small_mask = np.zeros_like(img, dtype=bool)
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] <= min_component_pixels:
-                small_mask |= (labels == i)
-    else:
-        small_mask = np.zeros_like(img, dtype=bool)
-
-    for _ in range(max_spur):
-        ys, xs = np.where(img > 0)
-        if len(xs) == 0:
-            break
-        fg = img > 0
-        n = np.zeros_like(img, dtype=np.int32)
-        for dy in [-1, 0, 1]:
-            for dx in [-1, 0, 1]:
-                if dy == 0 and dx == 0:
-                    continue
-                sy = max(0, -dy); ey = min(h, h - dy)
-                sx = max(0, -dx); ex = min(w, w - dx)
-                ty = max(0, dy);  tty = ty + (ey - sy)
-                tx = max(0, dx);  ttx = tx + (ex - sx)
-                n[sy:ey, sx:ex] += fg[ty:tty, tx:ttx].astype(np.int32)
-        endpoints = fg & (n == 1) & (~small_mask)
-        if not np.any(endpoints):
-            break
-        img[endpoints] = 0
-    return img
+        return binary
+        
+    contour_img = (binary * 255).astype(np.uint8)
+    contours, _ = cv2.findContours(contour_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    refined = binary.copy()
+    
+    for cnt in contours:
+        mask = np.zeros_like(binary, dtype=np.uint8)
+        cv2.drawContours(mask, [cnt], -1, 1, thickness=-1)
+        
+        # Calculate local thickness using Distance Transform
+        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+        _, max_val, _, _ = cv2.minMaxLoc(dist)
+        
+        # If it exceeds line thickness threshold, it is an filled area (e.g. Cat eyes)
+        if max_val > max_line_thickness:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            eroded = cv2.erode(mask, kernel, iterations=1)
+            boundary = cv2.bitwise_xor(mask, eroded)
+            
+            # Hollow out this region in final mask
+            refined[mask > 0] = 0
+            refined[boundary > 0] = 1
+            
+    return refined
 
 
 # ─── Skeletonization (Zhang-Suen, vectorized) ──────────────────────────────
@@ -374,8 +247,8 @@ def skeletonize(binary):
     return img
 
 
-def prune_skeleton(skel, max_spur=10):
-    """Remove short dead-end branches."""
+def prune_skeleton(skel, max_spur=2):
+    """Remove short dead-end branches gently."""
     img = skel.copy()
     h, w = img.shape
     for _ in range(max_spur):
@@ -530,7 +403,6 @@ def douglas_peucker(pts, eps):
 # ─── Coordinate Scaling ────────────────────────────────────────────────────
 
 def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
-    """Scale paths to ±240 canvas, simplify, resample."""
     all_pts = np.vstack(strokes_raw)
     cx = (all_pts[:,0].min() + all_pts[:,0].max()) / 2
     cy = (all_pts[:,1].min() + all_pts[:,1].max()) / 2
@@ -540,10 +412,7 @@ def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
 
     strokes = []
     for pts in strokes_raw:
-        if len(pts) <= 5:
-            simp = pts
-        else:
-            simp = douglas_peucker(pts, simplify_eps)
+        simp = douglas_peucker(pts, simplify_eps)
         if len(simp) < 2: continue
         smooth = resample_uniform(simp, resample_n) if len(simp) >= 3 else simp
         scaled = []
@@ -562,15 +431,9 @@ def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
 # --- Stroke Order Optimization (Nearest-Neighbor TSP) -----------------------
 
 def optimize_stroke_order(strokes):
-    """Reorder strokes to minimize travel distance between consecutive strokes.
-    
-    Uses greedy nearest-neighbor heuristic with stroke reversal consideration.
-    Starts from the stroke closest to X=0 (the stick).
-    """
     if len(strokes) <= 1:
         return strokes
     
-    # Work with copies so we don't mutate originals
     remaining = []
     for s in strokes:
         pts = s["points"]
@@ -581,8 +444,6 @@ def optimize_stroke_order(strokes):
         })
     
     ordered = []
-    
-    # 1. Start from stroke closest to X=0 (stick)
     stick = np.array([0.0, 0.0])
     best_idx = 0
     best_dist = float('inf')
@@ -594,14 +455,12 @@ def optimize_stroke_order(strokes):
             best_dist = d
             best_idx = i
     
-    # Add first stroke (reverse if end is closer to stick than start)
     first = remaining.pop(best_idx)
     if np.linalg.norm(first["end"] - stick) < np.linalg.norm(first["start"] - stick):
         first["points"].reverse()
         first["start"], first["end"] = first["end"], first["start"]
     ordered.append(first)
     
-    # 2. Greedily pick nearest unvisited stroke
     while remaining:
         current_end = ordered[-1]["end"]
         best_idx = 0
@@ -609,9 +468,7 @@ def optimize_stroke_order(strokes):
         best_reverse = False
         
         for i, s in enumerate(remaining):
-            # Distance if we use stroke as-is (start -> end)
             d_forward = np.linalg.norm(s["start"] - current_end)
-            # Distance if we reverse stroke (end -> start)
             d_reverse = np.linalg.norm(s["end"] - current_end)
             
             if d_forward < best_dist:
@@ -623,19 +480,16 @@ def optimize_stroke_order(strokes):
                 best_idx = i
                 best_reverse = True
         
-    
         chosen = remaining.pop(best_idx)
         if best_reverse:
             chosen["points"].reverse()
             chosen["start"], chosen["end"] = chosen["end"], chosen["start"]
         ordered.append(chosen)
     
-    # Calculate total travel distance for reporting
     total_travel = 0.0
     for i in range(1, len(ordered)):
         total_travel += np.linalg.norm(ordered[i]["start"] - ordered[i-1]["end"])
     
-    # Calculate original travel distance for comparison
     orig_travel = 0.0
     for i in range(1, len(strokes)):
         orig_travel += np.linalg.norm(
@@ -648,76 +502,28 @@ def optimize_stroke_order(strokes):
     return [{"points": s["points"]} for s in ordered]
 
 
-# --- Connectivity Enforcement (Sugar-Painting Optimized) --------------------
+# --- Connectivity Enforcement ------------------------------------------------
 
-def _nearest_endpoint_pair(strokes, idx_a, idx_b):
-    """Find the closest pair of endpoints between two strokes.
-    Returns (dist, endpoint_a_idx, endpoint_b_idx, reverse_b).
-    endpoint_a_idx: 0=start, -1=end of stroke A.
-    """
-    pa = strokes[idx_a]["points"]
-    pb = strokes[idx_b]["points"]
-    endpoints_a = [(np.array(pa[0]), 0), (np.array(pa[-1]), -1)]
-    endpoints_b = [(np.array(pb[0]), 0), (np.array(pb[-1]), -1)]
-    best_dist = float('inf')
-    best_a = best_b = 0
-    best_rev = False
-    for ea, ai in endpoints_a:
-        for eb, bi in endpoints_b:
-            d = np.linalg.norm(ea - eb)
-            if d < best_dist:
-                best_dist = d
-                best_a = ai
-                best_b = bi
-                best_rev = (bi == 0)
-    return best_dist, best_a, best_b, best_rev
-
-
-def _extend_stroke_to_meet(strokes, idx_from, endpoint_from, idx_to, endpoint_to):
-    """Extend stroke[idx_from] endpoint to meet stroke[idx_to] endpoint.
-
-    Instead of a separate bridge line, we insert intermediate points into the
-    from-stroke so it physically reaches the to-stroke's endpoint.
-    """
-    pa = strokes[idx_from]["points"]
-    pb = strokes[idx_to]["points"]
-    src = np.array(pa[-1 if endpoint_from == -1 else 0])
-    dst = np.array(pb[-1 if endpoint_to == -1 else 0])
-
-    dist = float(np.linalg.norm(src - dst))
-
-    if dist <= 5:
-        bridge_pts = [dst.tolist()]
-    else:
-        mid = (src + dst) / 2
-        bridge_pts = [mid.tolist(), dst.tolist()]
-
-    if endpoint_from == -1:
-        strokes[idx_from]["points"] = pa + bridge_pts
-    else:
-        strokes[idx_from]["points"] = bridge_pts + pa
-
-    return dist
-
-
-def enforce_connectivity(strokes, connect_threshold=30):
-    """Connect disconnected components by extending stroke endpoints.
-
-    Instead of adding separate 2-point bridge strokes, we extend the nearest
-    endpoint of one stroke to physically reach the nearest endpoint of another
-    stroke. This produces smoother, more natural sugar-painting paths.
-    """
+def enforce_connectivity(strokes, connect_threshold=25):
     if not strokes:
         return strokes
-
-    n = len(strokes)
-    STICK_TOL = 2
-    MAX_EXTEND = 40
-    max_iterations = 5
-    extended_strokes = set()
-
+    bridges = []
+    max_iterations = 20
     for iteration in range(max_iterations):
         n = len(strokes)
+        connected = [[False]*n for _ in range(n)]
+        for i in range(n):
+            connected[i][i] = True
+            pi = np.array(strokes[i]["points"])
+            for j in range(i+1, n):
+                pj = np.array(strokes[j]["points"])
+                min_dist = float('inf')
+                for p in pi:
+                    for q in pj:
+                        d = abs(p[0]-q[0]) + abs(p[1]-q[1])
+                        if d < min_dist: min_dist = d
+                if min_dist <= connect_threshold:
+                    connected[i][j] = True; connected[j][i] = True
         parent = list(range(n))
         def find(x):
             while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
@@ -725,65 +531,43 @@ def enforce_connectivity(strokes, connect_threshold=30):
         def union(a, b):
             a, b = find(a), find(b)
             if a != b: parent[b] = a
-
         for i in range(n):
             for j in range(i+1, n):
-                d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
-                if d <= connect_threshold:
-                    union(i, j)
-
+                if connected[i][j]: union(i, j)
         components = {}
         for i in range(n):
             root = find(i)
             components.setdefault(root, []).append(i)
-
         if len(components) == 1:
-            print(f"  All {n} strokes connected")
+            print(f"  All {n} strokes connected (threshold={connect_threshold})")
             break
-
         main_root = max(components, key=lambda r: len(components[r]))
         main_indices = set(components[main_root])
-        print(f"  Iteration {iteration+1}: {len(components)} components, extending endpoints...")
-
-        extensions = 0
+        print(f"  Iteration {iteration+1}: {len(components)} components, adding bridges...")
+        new_bridges = []
         for root, indices in components.items():
             if root == main_root: continue
-            best_dist = float('inf')
-            best_i = best_j = None
-            best_ep_a = best_ep_b = None
-            best_rev = False
-
+            best_dist = float('inf'); best_from = best_to = None
             for i in indices:
-                if i in extended_strokes:
-                    continue
+                pi = np.array(strokes[i]["points"])
                 for j in main_indices:
-                    d, ep_a, ep_b, rev = _nearest_endpoint_pair(strokes, i, j)
-                    if d < best_dist:
-                        best_dist = d
-                        best_i, best_j = i, j
-                        best_ep_a, best_ep_b = ep_a, ep_b
-                        best_rev = rev
-
-            if best_i is not None and best_dist <= MAX_EXTEND:
-                dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
-                                               best_j, best_ep_b)
-                extensions += 1
-                extended_strokes.add(best_i)
+                    pj = np.array(strokes[j]["points"])
+                    for p in pi:
+                        for q in pj:
+                            d = abs(p[0]-q[0]) + abs(p[1]-q[1])
+                            if d < best_dist:
+                                best_dist = d
+                                best_from = [int(p[0]), int(p[1])]
+                                best_to = [int(q[0]), int(q[1])]
+            if best_from and best_to:
+                bridge = {"points": [best_from, best_to]}
+                new_bridges.append(bridge); bridges.append(bridge)
+                print(f"    Bridge: {best_from} -> {best_to} (dist={best_dist:.0f})")
                 main_indices.update(indices)
-                print(f"    Extended stroke {best_i} -> {best_j} (dist={dist:.0f})")
-            else:
-                print(f"    Skipped orphan (dist={best_dist:.0f} > {MAX_EXTEND})")
-
-        if extensions == 0:
-            break
-
-        if extensions == 0:
-            break
-
-    _connect_remaining_orphans(strokes)
-
+        if not new_bridges: break
+        strokes = strokes + new_bridges
     touches_stick = any(
-        any(abs(p[0]) <= STICK_TOL for p in st["points"]) for st in strokes
+        any(abs(p[0]) <= 2 for p in st["points"]) for st in strokes
     )
     if not touches_stick:
         best_stroke = 0; best_dist = float('inf'); best_point = None
@@ -797,184 +581,8 @@ def enforce_connectivity(strokes, connect_threshold=30):
         print(f"  Stick root added: {anchor}")
     else:
         print(f"  Stick adhesion: OK")
-
-    return strokes
-
-
-def _connect_remaining_orphans(strokes):
-    """Connect or remove orphan strokes after main connectivity loop.
-
-    Strokes whose nearest endpoint is within 80px of another stroke's
-    endpoint are connected. Others are removed (too far for sugar painting).
-    """
-    if len(strokes) <= 1:
-        return
-
-    n = len(strokes)
-    parent = list(range(n))
-    def find(x):
-        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
-        return x
-    def union(a, b):
-        a, b = find(a), find(b)
-        if a != b: parent[b] = a
-
-    for i in range(n):
-        for j in range(i+1, n):
-            d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
-            if d <= 30:
-                union(i, j)
-
-    components = {}
-    for i in range(n):
-        root = find(i)
-        components.setdefault(root, []).append(i)
-
-    if len(components) == 1:
-        return
-
-    main_root = max(components, key=lambda r: len(components[r]))
-    print(f"  Processing {len(components)-1} orphan components...")
-
-    removed_orphans = set()
-    for root, indices in components.items():
-        if root == main_root:
-            continue
-
-        best_dist = float('inf')
-        best_i = best_j = None
-        best_ep_a = best_ep_b = None
-
-        for i in indices:
-            for j in range(n):
-                if j in indices:
-                    continue
-                d, ep_a, ep_b, _ = _nearest_endpoint_pair(strokes, i, j)
-                if d < best_dist:
-                    best_dist = d
-                    best_i, best_j = i, j
-                    best_ep_a, best_ep_b = ep_a, ep_b
-
-        if best_i is not None and best_dist <= 80:
-            dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
-                                           best_j, best_ep_b)
-            for idx in indices:
-                parent[find(idx)] = main_root
-            print(f"    Connected orphan stroke {best_i} -> {best_j} (dist={dist:.0f})")
-        else:
-            for idx in indices:
-                removed_orphans.add(idx)
-            print(f"    Removed far orphan ({len(indices)} strokes, dist={best_dist:.0f})")
-
-    if removed_orphans:
-        strokes[:] = [s for i, s in enumerate(strokes) if i not in removed_orphans]
-        print(f"  After orphan cleanup: {len(strokes)} strokes")
-
-
-def merge_short_strokes(strokes, min_pts=2, min_size=10, max_merge_dist=50, max_total_length=50,
-                         max_aspect_ratio=8.0):
-    """Absorb short or tiny strokes into neighboring strokes.
-
-    A stroke is considered 'mergeable' if:
-      - it has <= min_pts points, OR
-      - its bounding box is smaller than min_size in BOTH dimensions, OR
-      - its total path length < max_total_length (short arc)
-
-    A stroke is considered 'junk' (removed without merge) if:
-      - it has extreme aspect ratio (> max_aspect_ratio) AND is small (bbox area < 2000)
-
-    Only merges if the nearest endpoint is within max_merge_dist pixels.
-    """
-    if len(strokes) <= 1:
-        return strokes
-
-    def total_length(pts):
-        arr = np.array(pts)
-        return float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1)))
-
-    def is_mergeable(s):
-        pts = np.array(s["points"])
-        if len(pts) <= min_pts:
-            return True
-        w = pts[:, 0].max() - pts[:, 0].min()
-        h = pts[:, 1].max() - pts[:, 1].min()
-        if w < min_size and h < min_size:
-            return True
-        if total_length(s["points"]) < max_total_length:
-            return True
-        return False
-
-    def is_junk(s):
-        pts = np.array(s["points"])
-        w = pts[:, 0].max() - pts[:, 0].min()
-        h = pts[:, 1].max() - pts[:, 1].min()
-        area = (w + 1) * (h + 1)
-        if area > 2000:
-            return False
-        aspect = max(w, h) / max(min(w, h), 1)
-        return aspect > max_aspect_ratio
-
-    mergeable = [i for i, s in enumerate(strokes) if is_mergeable(s)]
-    if not mergeable:
-        return strokes
-
-    removed = set()
-    for si in mergeable:
-        if si in removed:
-            continue
-        s_pts = strokes[si]["points"]
-        s_start = np.array(s_pts[0])
-        s_end = np.array(s_pts[-1])
-        s_mid = (s_start + s_end) / 2
-
-        best_dist = float('inf')
-        best_li = None
-        best_lep = None
-
-        for li, ls in enumerate(strokes):
-            if li == si or li in removed:
-                continue
-            l_pts = ls["points"]
-            for ep_idx, ep in [(0, np.array(l_pts[0])), (-1, np.array(l_pts[-1]))]:
-                for sep in [s_start, s_end]:
-                    d = np.linalg.norm(ep - sep)
-                    if d < best_dist:
-                        best_dist = d
-                        best_li = li
-                        best_lep = ep_idx
-
-        if best_li is not None and best_dist <= max_merge_dist:
-            target = strokes[best_li]
-            t_pts = target["points"]
-            t_ep = np.array(t_pts[-1 if best_lep == -1 else 0])
-            mid = ((t_ep + s_mid) / 2).tolist()
-            if best_lep == -1:
-                target["points"] = t_pts + [mid] + s_pts
-            else:
-                target["points"] = s_pts + [mid] + t_pts
-            removed.add(si)
-            print(f"  Merged stroke {si} ({len(s_pts)}pts) into {best_li} (dist={best_dist:.0f})")
-
-    if removed:
-        strokes = [s for i, s in enumerate(strokes) if i not in removed]
-        print(f"  After merge: {len(strokes)} strokes")
-
-    removed2 = set()
-    for i, s in enumerate(strokes):
-        pts = np.array(s["points"])
-        w = pts[:, 0].max() - pts[:, 0].min()
-        h = pts[:, 1].max() - pts[:, 1].min()
-        length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-        is_tiny = (w < min_size and h < min_size) or length < max_total_length
-        if is_tiny or is_junk(s):
-            removed2.add(i)
-            reason = "junk" if is_junk(s) else "tiny"
-            print(f"  Removed orphan {reason} stroke {i} ({len(pts)}pts, {w:.0f}x{h:.0f}, len={length:.0f})")
-
-    if removed2:
-        strokes = [s for i, s in enumerate(strokes) if i not in removed2]
-        print(f"  After orphan removal: {len(strokes)} strokes")
-
+    if bridges:
+        print(f"  Total bridges added: {len(bridges)}")
     return strokes
 
 
@@ -1060,32 +668,34 @@ def _render_panel(draw, strokes, x_offset, sz, label):
     draw.text((x_offset + 10, 8), f"{label} ({n} strokes, {p} pts)", fill="#666")
 
 
-def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15):
+def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=None):
     defaults = MODE_DEFAULTS[mode]
+    p_val = prune if prune is not None else defaults["prune"]
+    
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
     else:
         binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
-    filled_strokes, binary = extract_filled_regions(binary)
-    thin_strokes, binary = extract_thin_features(binary)
+    
+    # Apply feature preservation
+    binary = hollow_thick_blobs(binary)
+        
     skel = skeletonize(binary)
     print(f"  Skeleton: {np.count_nonzero(skel)} pixels")
-    if prune > 0:
-        skel = prune_skeleton_adaptive(skel, max_spur=prune)
+    if p_val > 0:
+        skel = prune_skeleton(skel, max_spur=p_val)
         print(f"  Pruned: {np.count_nonzero(skel)} pixels")
     paths = extract_all_paths(skel)
-    all_strokes = filled_strokes + thin_strokes + paths
-    if not all_strokes:
+    if not paths:
         return [], {}
-    smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in all_strokes]
+    smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in paths]
     strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"])
     strokes = enforce_connectivity(strokes)
-    strokes = merge_short_strokes(strokes)
     strokes = optimize_stroke_order(strokes)
     return strokes, defaults
 
 
-def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=5):
+def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=None):
     from PIL import ImageDraw
     print("\n== Line Art Mode ==")
     strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune)
@@ -1116,66 +726,66 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
-         threshold=None, min_contour_area=50, prune=2, compare=False, debug=False,
-         min_component_pixels=15):
+         threshold=None, min_contour_area=50, prune=None, compare=False, debug=False):
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
         arr_tmp = np.array(img_tmp)
         mode = detect_source_type(arr_tmp)
         print(f"Auto-detected: {mode}")
+        
     defaults = MODE_DEFAULTS[mode]
     max_dim = max_dim or defaults["max_dim"]
     smooth_sigma = smooth_sigma if smooth_sigma is not None else defaults["sigma"]
     simplify_eps = simplify_eps if simplify_eps is not None else defaults["eps"]
     resample_n = resample_n if resample_n is not None else defaults["resample"]
+    p_val = prune if prune is not None else defaults["prune"]
+    
     gray_arr, orig_size = load_and_resize(image_path, max_dim)
     if compare:
-        run_comparison(gray_arr, output_path, lineart_threshold=threshold, min_contour_area=min_contour_area, prune=prune)
+        run_comparison(gray_arr, output_path, lineart_threshold=threshold, min_contour_area=min_contour_area, prune=p_val)
         return
+        
     print(f"Mode: {mode} | sigma={smooth_sigma} eps={simplify_eps} "
-          f"resample={resample_n} max_dim={max_dim}")
+          f"resample={resample_n} max_dim={max_dim} prune={p_val}")
+          
     print("Binarizing...")
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
     else:
         binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
-    print("Extracting filled regions (eyes, etc.)...")
-    filled_strokes, binary = extract_filled_regions(binary)
-    print("Extracting thin features (whiskers, etc.)...")
-    thin_strokes, binary = extract_thin_features(binary)
+        
+    # Hollow thick blobs before skeletonization
+    print("Preserving internal dense features...")
+    binary = hollow_thick_blobs(binary)
+        
     print("Skeletonizing...")
     skel = skeletonize(binary)
     print(f"Skeleton: {np.count_nonzero(skel)} pixels")
-    if prune > 0:
-        skel = prune_skeleton_adaptive(skel, max_spur=prune,
-                                       min_component_pixels=min_component_pixels)
-        print(f"Pruned: {np.count_nonzero(skel)} pixels (max_spur={prune})")
+    if p_val > 0:
+        skel = prune_skeleton(skel, max_spur=p_val)
+        print(f"Pruned: {np.count_nonzero(skel)} pixels (max_spur={p_val})")
     if debug:
         save_debug_images(binary, skel, output_path)
+        
     print("Tracing skeleton graph...")
     strokes_raw = extract_all_paths(skel)
-    print(f"Extracted {len(strokes_raw)} skeleton paths")
-    if filled_strokes:
-        print(f"Adding {len(filled_strokes)} filled-region contour strokes")
-    if thin_strokes:
-        print(f"Adding {len(thin_strokes)} thin-feature strokes (whiskers)")
-    strokes_raw = filled_strokes + thin_strokes + strokes_raw
-    print(f"Total paths: {len(strokes_raw)}")
+    print(f"Extracted {len(strokes_raw)} paths")
     if not strokes_raw:
         print("No strokes found!"); return
+        
     print(f"Smoothing (sigma={smooth_sigma})...")
     strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
     strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n)
+    
     total = sum(len(st["points"]) for st in strokes)
     print(f"Before connectivity: {len(strokes)} strokes, {total} points")
+    
     print("Enforcing connectivity...")
-    strokes = enforce_connectivity(strokes, connect_threshold=15)
-    total = sum(len(st["points"]) for st in strokes)
-    print(f"Merging short strokes...")
-    strokes = merge_short_strokes(strokes)
-    total = sum(len(st["points"]) for st in strokes)
+    strokes = enforce_connectivity(strokes, connect_threshold=25)
+    
     print(f"Optimizing stroke order...")
     strokes = optimize_stroke_order(strokes)
+    
     total = sum(len(st["points"]) for st in strokes)
     print(f"Final: {len(strokes)} strokes, {total} points")
     plan = build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
@@ -1187,39 +797,19 @@ def main(image_path, output_path, mode="auto", max_dim=None,
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Image to sugar painting trajectory converter",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python image_to_trajectory.py unicorn.jpg output.json
-  python image_to_trajectory.py photo.jpg photo.json --mode photo
-  python image_to_trajectory.py sketch.png output.json --compare
-  python image_to_trajectory.py portrait.jpg out.json --sigma 8 --eps 3
-        """)
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="Input image path")
-    parser.add_argument("output", nargs="?", default=None,
-                        help="Output JSON (default: derived from input)")
-    parser.add_argument("--mode", choices=["auto", "lineart", "photo"],
-                        default="auto", help="Processing mode (default: auto)")
-    parser.add_argument("--sigma", type=float, default=None,
-                        help="Gaussian smoothing sigma")
-    parser.add_argument("--eps", type=float, default=None,
-                        help="Douglas-Peucker simplification epsilon")
-    parser.add_argument("--max-dim", type=int, default=None, dest="max_dim",
-                        help="Max image dimension in pixels")
-    parser.add_argument("--resample", type=int, default=None,
-                        help="Target points per stroke")
-    parser.add_argument("--prune", type=int, default=2,
-                        help="Skeleton pruning iterations (default: 2)")
-    parser.add_argument("--min-contour", type=int, default=50, dest="min_contour_area",
-                        help="Min contour area to keep (photo mode, default: 50)")
-    parser.add_argument("--min-component", type=int, default=15, dest="min_component_pixels",
-                        help="Min component size for adaptive pruning (default: 15)")
-    parser.add_argument("--threshold", type=int, default=None,
-                        help="Manual threshold (lineart only)")
-    parser.add_argument("--compare", action="store_true",
-                        help="Run both modes, side-by-side comparison")
-    parser.add_argument("--debug", action="store_true",
-                        help="Save intermediate images")
+    parser.add_argument("output", nargs="?", default=None, help="Output JSON")
+    parser.add_argument("--mode", choices=["auto", "lineart", "photo"], default="auto")
+    parser.add_argument("--sigma", type=float, default=None)
+    parser.add_argument("--eps", type=float, default=None)
+    parser.add_argument("--max-dim", type=int, default=None, dest="max_dim")
+    parser.add_argument("--resample", type=int, default=None)
+    parser.add_argument("--prune", type=int, default=None, help="Skeleton pruning iterations")
+    parser.add_argument("--min-contour", type=int, default=50, dest="min_contour_area")
+    parser.add_argument("--threshold", type=int, default=None)
+    parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
@@ -1238,5 +828,6 @@ if __name__ == "__main__":
         prune=args.prune,
         compare=args.compare,
         debug=args.debug,
-        min_component_pixels=args.min_component_pixels,
     )
+
+```

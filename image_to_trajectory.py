@@ -25,8 +25,8 @@ except ImportError:
 
 MODE_DEFAULTS = {
     "lineart": {
-        "sigma": 4.0, "eps": 0.8, "max_dim": 200,
-        "resample": 100, "threshold": None,
+        "sigma": 2.0, "eps": 1.0, "max_dim": 400,
+        "resample": 150, "threshold": None,
     },
     "photo": {
         "sigma": 6.0, "eps": 2.5, "max_dim": 250,
@@ -40,19 +40,6 @@ COLORS = [
     "#dcbeff", "#9A6324", "#800000", "#aaffc3", "#808000",
     "#ffd8b1", "#000075", "#a9a9a9", "#fffac8", "#7cb342",
 ]
-
-# ─── Border / frame detection (shared by skeleton + contour pipelines) ──────
-
-def bbox_hugs_border(points, h, w, tol_frac=0.03, tol_min=3):
-    """True if the bbox of `points` (Nx2, [x, y] y-down image coords) reaches
-    all four image edges within tol — i.e. the path runs along the canvas/frame
-    rectangle. Pure numpy, pipeline-agnostic; used to drop the border skeleton/
-    contour. tol = max(tol_min, round(tol_frac * max(h, w)))."""
-    tol = max(tol_min, int(round(tol_frac * max(h, w))))
-    x0, x1 = points[:, 0].min(), points[:, 0].max()
-    y0, y1 = points[:, 1].min(), points[:, 1].max()
-    return (x0 <= tol and x1 >= w - 1 - tol and
-            y0 <= tol and y1 >= h - 1 - tol)
 
 # ─── Image Loading ──────────────────────────────────────────────────────────
 
@@ -76,56 +63,56 @@ def detect_source_type(gray_arr):
         print("  (cv2 not available, defaulting to lineart)")
         return "lineart"
 
-    # Canny edges
     edges = cv2.Canny(gray_arr, 50, 150)
     edge_density = np.count_nonzero(edges) / edges.size
-
-    # Intensity variance
     variance = np.var(gray_arr.astype(np.float64))
-
-    # Unique values (very few = likely digital/vector art)
     unique = len(np.unique(gray_arr))
 
     mode = "lineart"
     if edge_density >= 0.08 or variance < 500:
         mode = "photo"
     if unique < 15:
-        mode = "lineart"  # clearly digital art
+        mode = "lineart"
 
     print(f"  Detection: edge_density={edge_density:.4f}, variance={variance:.0f}, "
           f"unique={unique} → {mode}")
     return mode
 
 
+def is_dark_background(gray_arr):
+    """Detect if image has a dark background (lines are lighter than background)."""
+    return float(np.mean(gray_arr)) < 128
+
+
 # ─── Binarization: Line Art Mode ────────────────────────────────────────────
 
-def binarize_lineart(gray_arr, threshold=None):
-    """Otsu auto-threshold (or manual) + Gaussian blur + morph open."""
+def binarize_lineart(gray_arr, threshold=None, invert=None):
+    """Otsu auto-threshold (or manual) — minimal pre-processing to preserve thin lines.
+
+    invert: None = auto-detect dark background, True = force invert, False = no invert
+    """
     img = gray_arr.copy()
 
-    if HAS_CV2:
-        # Gaussian blur to remove JPEG artifacts
-        img = cv2.GaussianBlur(img, (3, 3), 0)
+    if invert is None:
+        invert = is_dark_background(gray_arr)
+        if invert:
+            print("  Dark background detected — inverting")
 
+    if invert:
+        img = 255 - img
+
+    if HAS_CV2:
         if threshold is not None:
-            # Manual threshold (inverted: dark lines → white)
             _, binary = cv2.threshold(img, threshold, 255,
                                        cv2.THRESH_BINARY_INV)
         else:
-            # Otsu's auto-threshold
             _, binary = cv2.threshold(img, 0, 255,
                                        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        # Remove isolated noise pixels
-        kernel = np.ones((2, 2), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     else:
-        # Fallback: pure numpy
         if threshold is None:
             threshold = 150
         binary = ((img < threshold) * 255).astype(np.uint8)
 
-    # Convert to 0/1
     result = (binary > 0).astype(np.uint8)
     print(f"  Line pixels: {np.count_nonzero(result)}")
     return result
@@ -193,6 +180,169 @@ def binarize_photo(gray_arr, min_contour_area=50):
     return result
 
 
+# ─── Thin Feature (Whisker) Extraction ─────────────────────────────────────
+
+def extract_thin_features(binary, min_length=10, aspect_ratio_min=3.0, thin_width=4):
+    """Detect thin elongated features (whiskers, thin lines) directly from binary.
+
+    These features often get lost during skeletonization because they're only
+    1-3px wide and may not survive Zhang-Suen thinning well.
+
+    Returns (thin_strokes, cleaned_binary) where thin_strokes are path arrays
+    and cleaned_binary has the thin features removed.
+    """
+    if not HAS_CV2:
+        return [], binary.copy()
+
+    cleaned = binary.copy()
+    thin_strokes = []
+
+    # Create mask of thin pixels (distance from edge < thin_width)
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    thin_mask = ((dist > 0) & (dist <= thin_width)).astype(np.uint8) * 255
+
+    # Also include pixels that are on thin lines (skeleton-like)
+    # Use morphological gradient to find edges of thin structures
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(binary, kernel, iterations=1)
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    gradient = cv2.subtract(dilated, eroded)
+    thin_mask = cv2.bitwise_or(thin_mask, gradient)
+
+    # Clean up thin mask
+    thin_mask = cv2.morphologyEx(thin_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Find connected components in thin mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        thin_mask, connectivity=8
+    )
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+
+        # Calculate aspect ratio
+        if min(w, h) == 0:
+            continue
+        ar = max(w, h) / min(w, h)
+
+        # Check if this is an elongated thin feature
+        if ar >= aspect_ratio_min and max(w, h) >= min_length:
+            # Extract path from this component's pixels
+            component_mask = (labels == i).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+
+            cnt = max(contours, key=cv2.contourArea)
+            # Simplify contour to get a clean path
+            epsilon = 0.02 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon)
+
+            pts = approx.squeeze()
+            if pts.ndim != 2 or len(pts) < 3:
+                continue
+
+            pts = pts.astype(np.float64)
+            thin_strokes.append(pts)
+            # Remove from binary to avoid duplicate skeleton strokes
+            cleaned[labels == i] = 0
+            print(f"    Thin feature #{i}: {w}x{h}, ar={ar:.1f}, area={area} → stroke")
+
+    return thin_strokes, cleaned
+
+def extract_filled_regions(binary, min_area=30, max_area=800, roundness_thresh=0.5):
+    """Detect small filled components (e.g. cat eyes) and extract their contours.
+
+    Returns (contour_strokes, cleaned_binary) where contour_strokes is a list of
+    Nx2 numpy arrays (closed contours) and cleaned_binary has the filled regions
+    removed so skeletonize doesn't create noise.
+    """
+    if not HAS_CV2:
+        return [], binary.copy()
+
+    cleaned = binary.copy()
+    contour_strokes = []
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    for i in range(1, num_labels):  # skip background
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_area:
+            continue
+
+        mask = (labels == i).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        cnt = max(contours, key=cv2.contourArea)
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1e-6:
+            continue
+        circularity = 4 * np.pi * area / (peri * peri)
+
+        if circularity >= roundness_thresh:
+            pts = cnt.squeeze()
+            if pts.ndim != 2:
+                continue
+            pts = pts.astype(np.float64)
+            # Close the contour
+            pts = np.vstack([pts, pts[0:1]])
+            contour_strokes.append(pts)
+            cleaned[labels == i] = 0
+            print(f"    Filled region #{i}: area={area}, circularity={circularity:.2f} → contour stroke")
+
+    return contour_strokes, cleaned
+
+
+# ─── Adaptive Pruning (length-aware) ──────────────────────────────────────
+
+def prune_skeleton_adaptive(skel, max_spur=5, min_component_pixels=15):
+    """Remove short dead-end branches, but preserve small independent components.
+
+    Before pruning, identify connected components smaller than min_component_pixels.
+    These are likely features like whisker tips or small details — skip pruning on them.
+    """
+    img = skel.copy()
+    h, w = img.shape
+
+    if HAS_CV2:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img, connectivity=8)
+        small_mask = np.zeros_like(img, dtype=bool)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] <= min_component_pixels:
+                small_mask |= (labels == i)
+    else:
+        small_mask = np.zeros_like(img, dtype=bool)
+
+    for _ in range(max_spur):
+        ys, xs = np.where(img > 0)
+        if len(xs) == 0:
+            break
+        fg = img > 0
+        n = np.zeros_like(img, dtype=np.int32)
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dy == 0 and dx == 0:
+                    continue
+                sy = max(0, -dy); ey = min(h, h - dy)
+                sx = max(0, -dx); ex = min(w, w - dx)
+                ty = max(0, dy);  tty = ty + (ey - sy)
+                tx = max(0, dx);  ttx = tx + (ex - sx)
+                n[sy:ey, sx:ex] += fg[ty:tty, tx:ttx].astype(np.int32)
+        endpoints = fg & (n == 1) & (~small_mask)
+        if not np.any(endpoints):
+            break
+        img[endpoints] = 0
+    return img
+
+
 # ─── Skeletonization (Zhang-Suen, vectorized) ──────────────────────────────
 
 def skeletonize(binary):
@@ -249,16 +399,8 @@ def prune_skeleton(skel, max_spur=10):
 
 # ─── Path Extraction (DFS with heading-aware traversal) ─────────────────────
 
-def extract_all_paths(skel, min_stroke_points=2, start_from="center"):
-    """Extract ordered paths from skeleton using DFS traversal.
-
-    min_stroke_points: drop paths shorter than this (default 2) so 1px noise drops
-    but short features (whiskers, ear tips) survive. trace_from already follows a
-    single curve through junctions (heading-aware).
-    start_from: 'center' (default) — starts nearest the image centre (keeps long
-    curves as independent strokes; replicates the old version's detail-preserving
-    structure). 'nearest' — starts nearest an already-traced stroke endpoint
-    (extends/merges collinear long runs; use for filled blobs like love.png)."""
+def extract_all_paths(skel):
+    """Extract ordered paths from skeleton using DFS traversal."""
     h, w = skel.shape
     fg = set()
     ys, xs = np.where(skel > 0)
@@ -318,30 +460,15 @@ def extract_all_paths(skel, min_stroke_points=2, start_from="center"):
     for ep in sorted(endpoints, key=lambda p: p[0]*w + p[1]):
         if ep in visited: continue
         path = trace_from(ep)
-        if len(path) >= min_stroke_points:
+        if len(path) >= 3:
             all_paths.append(path)
 
     while True:
         remaining = fg - visited
         if not remaining: break
-        if start_from == "center":
-            # Old behavior: start nearest the image centre. Keeps long curves as
-            # independent strokes (matches the pre-optimization reference).
-            start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
-        elif all_paths:
-            # Start nearest an already-traced stroke endpoint (extends existing
-            # curves) instead of the image centre (which spawns short fragments).
-            endpoints_traced = []
-            for p in all_paths:
-                endpoints_traced.append((p[0][1], p[0][0]))    # (y, x) of start
-                endpoints_traced.append((p[-1][1], p[-1][0]))  # (y, x) of end
-            start = min(remaining,
-                        key=lambda q: min((q[0]-ey)**2 + (q[1]-ex)**2
-                                          for ey, ex in endpoints_traced))
-        else:
-            start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
+        start = min(remaining, key=lambda p: abs(p[0]-h//2) + abs(p[1]-w//2))
         path = trace_from(start)
-        if len(path) >= min_stroke_points:
+        if len(path) >= 3:
             all_paths.append(path)
         else:
             visited.add(start)
@@ -402,9 +529,8 @@ def douglas_peucker(pts, eps):
 
 # ─── Coordinate Scaling ────────────────────────────────────────────────────
 
-def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=2):
-    """Scale paths to ±240 canvas, simplify, resample. Drops strokes with fewer
-    than min_stroke_points points after dedup (trivial fragments)."""
+def scale_to_canvas(strokes_raw, simplify_eps, resample_n):
+    """Scale paths to ±240 canvas, simplify, resample."""
     all_pts = np.vstack(strokes_raw)
     cx = (all_pts[:,0].min() + all_pts[:,0].max()) / 2
     cy = (all_pts[:,1].min() + all_pts[:,1].max()) / 2
@@ -414,7 +540,6 @@ def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=2):
 
     strokes = []
     for pts in strokes_raw:
-        # Skip simplification for very short paths (preserves small features like eyes)
         if len(pts) <= 5:
             simp = pts
         else:
@@ -429,7 +554,7 @@ def scale_to_canvas(strokes_raw, simplify_eps, resample_n, min_stroke_points=2):
         d = [scaled[0]]
         for p in scaled[1:]:
             if p != d[-1]: d.append(p)
-        if len(d) >= min_stroke_points:
+        if len(d) >= 2:
             strokes.append({"points": d})
     return strokes
 
@@ -523,37 +648,164 @@ def optimize_stroke_order(strokes):
     return [{"points": s["points"]} for s in ordered]
 
 
-# --- Connectivity Enforcement (Stick-Aware) ----------------------------------
+# --- Connectivity Enforcement (Sugar-Painting Optimized) --------------------
+
+def _nearest_endpoint_pair(strokes, idx_a, idx_b):
+    """Find the closest pair of endpoints between two strokes.
+    Returns (dist, endpoint_a_idx, endpoint_b_idx, reverse_b).
+    endpoint_a_idx: 0=start, -1=end of stroke A.
+    """
+    pa = strokes[idx_a]["points"]
+    pb = strokes[idx_b]["points"]
+    endpoints_a = [(np.array(pa[0]), 0), (np.array(pa[-1]), -1)]
+    endpoints_b = [(np.array(pb[0]), 0), (np.array(pb[-1]), -1)]
+    best_dist = float('inf')
+    best_a = best_b = 0
+    best_rev = False
+    for ea, ai in endpoints_a:
+        for eb, bi in endpoints_b:
+            d = np.linalg.norm(ea - eb)
+            if d < best_dist:
+                best_dist = d
+                best_a = ai
+                best_b = bi
+                best_rev = (bi == 0)
+    return best_dist, best_a, best_b, best_rev
+
+
+def _extend_stroke_to_meet(strokes, idx_from, endpoint_from, idx_to, endpoint_to):
+    """Extend stroke[idx_from] endpoint to meet stroke[idx_to] endpoint.
+
+    Inserts the destination endpoint into the from-stroke so it physically
+    reaches the to-stroke's endpoint. No midpoint — direct connection.
+    """
+    pa = strokes[idx_from]["points"]
+    pb = strokes[idx_to]["points"]
+    dst = np.array(pb[-1 if endpoint_to == -1 else 0])
+
+    bridge_pts = [dst.tolist()]
+
+    if endpoint_from == -1:
+        strokes[idx_from]["points"] = pa + bridge_pts
+    else:
+        strokes[idx_from]["points"] = bridge_pts + pa
+
+    src = np.array(pa[-1 if endpoint_from == -1 else 0])
+    return float(np.linalg.norm(src - dst))
+
 
 def enforce_connectivity(strokes, connect_threshold=30):
-    """Enforce connectivity with stick-aware rules:
-    
-    Rules:
-    1. Strokes crossing X=0 (the stick) are 'anchored' — no forced connection needed.
-    2. Strokes connected to anchored strokes (within threshold) are also OK.
-    3. Orphan strokes (no X=0 crossing, no connection to any OK stroke) are handled by
-       extending the stroke endpoint to the nearest anchor — NOT by adding separate bridges.
-       If the nearest anchor is too far (> MAX_EXTEND_DIST), the orphan is left as-is
-       (likely a small detail that doesn't need structural support).
-    
-    Unlike the old approach, multiple independent anchored components are allowed.
+    """Connect disconnected components by extending stroke endpoints.
+
+    Instead of adding separate 2-point bridge strokes, we extend the nearest
+    endpoint of one stroke to physically reach the nearest endpoint of another
+    stroke. This produces smoother, more natural sugar-painting paths.
     """
     if not strokes:
         return strokes
-    
-    STICK_TOL = 2      # |x| <= 2 counts as touching the stick
-    MAX_EXTEND_DIST = 40  # Don't extend if nearest anchor is farther than this
+
     n = len(strokes)
-    extensions = 0
-    
-    # --- Step 1: Identify anchored strokes (cross X=0) ---
-    def crosses_stick(stroke):
-        return any(abs(p[0]) <= STICK_TOL for p in stroke["points"])
-    
-    anchored = set(i for i, st in enumerate(strokes) if crosses_stick(st))
-    print(f"  Anchored (cross X=0): {len(anchored)} strokes")
-    
-    # --- Step 2: Build connectivity graph (union-find) ---
+    STICK_TOL = 2
+    MAX_EXTEND = 40
+    max_iterations = 5
+    extended_strokes = set()
+
+    for iteration in range(max_iterations):
+        n = len(strokes)
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b: parent[b] = a
+
+        for i in range(n):
+            for j in range(i+1, n):
+                d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
+                if d <= connect_threshold:
+                    union(i, j)
+
+        components = {}
+        for i in range(n):
+            root = find(i)
+            components.setdefault(root, []).append(i)
+
+        if len(components) == 1:
+            print(f"  All {n} strokes connected")
+            break
+
+        main_root = max(components, key=lambda r: len(components[r]))
+        main_indices = set(components[main_root])
+        print(f"  Iteration {iteration+1}: {len(components)} components, extending endpoints...")
+
+        extensions = 0
+        for root, indices in components.items():
+            if root == main_root: continue
+            best_dist = float('inf')
+            best_i = best_j = None
+            best_ep_a = best_ep_b = None
+            best_rev = False
+
+            for i in indices:
+                if i in extended_strokes:
+                    continue
+                for j in main_indices:
+                    d, ep_a, ep_b, rev = _nearest_endpoint_pair(strokes, i, j)
+                    if d < best_dist:
+                        best_dist = d
+                        best_i, best_j = i, j
+                        best_ep_a, best_ep_b = ep_a, ep_b
+                        best_rev = rev
+
+            if best_i is not None and best_dist <= MAX_EXTEND:
+                dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
+                                               best_j, best_ep_b)
+                extensions += 1
+                extended_strokes.add(best_i)
+                main_indices.update(indices)
+                print(f"    Extended stroke {best_i} -> {best_j} (dist={dist:.0f})")
+            else:
+                print(f"    Skipped orphan (dist={best_dist:.0f} > {MAX_EXTEND})")
+
+        if extensions == 0:
+            break
+
+        if extensions == 0:
+            break
+
+    _connect_remaining_orphans(strokes)
+
+    touches_stick = any(
+        any(abs(p[0]) <= STICK_TOL for p in st["points"]) for st in strokes
+    )
+    if not touches_stick:
+        best_stroke = 0; best_dist = float('inf'); best_point = None
+        for idx, st in enumerate(strokes):
+            for p in st["points"]:
+                d = abs(p[0])
+                if d < best_dist:
+                    best_dist = d; best_stroke = idx; best_point = p
+        anchor = [0, best_point[1]]
+        strokes[best_stroke]["points"] = [anchor] + strokes[best_stroke]["points"]
+        print(f"  Stick root added: {anchor}")
+    else:
+        print(f"  Stick adhesion: OK")
+
+    return strokes
+
+
+def _connect_remaining_orphans(strokes):
+    """Connect or remove orphan strokes after main connectivity loop.
+
+    Strokes whose nearest endpoint is within 40px of another stroke's
+    endpoint are connected. Others are kept (connect_orphans_to_axis will
+    handle them later).
+    """
+    if len(strokes) <= 1:
+        return
+
+    n = len(strokes)
     parent = list(range(n))
     def find(x):
         while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
@@ -561,109 +813,244 @@ def enforce_connectivity(strokes, connect_threshold=30):
     def union(a, b):
         a, b = find(a), find(b)
         if a != b: parent[b] = a
-    
+
     for i in range(n):
-        pi = np.array(strokes[i]["points"])
         for j in range(i+1, n):
-            pj = np.array(strokes[j]["points"])
-            min_dist = float('inf')
-            for p in pi:
-                for q in pj:
-                    d = abs(p[0]-q[0]) + abs(p[1]-q[1])
-                    if d < min_dist: min_dist = d
-            if min_dist <= connect_threshold:
+            d, _, _, _ = _nearest_endpoint_pair(strokes, i, j)
+            if d <= 30:
                 union(i, j)
-    
-    # --- Step 3: Find connected components ---
+
     components = {}
     for i in range(n):
         root = find(i)
         components.setdefault(root, []).append(i)
-    
-    # A component is 'OK' if it contains any anchored stroke
-    ok_roots = set()
-    orphan_roots = set()
+
+    if len(components) == 1:
+        return
+
+    main_root = max(components, key=lambda r: len(components[r]))
+    print(f"  Processing {len(components)-1} orphan components...")
+
     for root, indices in components.items():
-        if any(i in anchored for i in indices):
-            ok_roots.add(root)
-        else:
-            orphan_roots.add(root)
-    
-    print(f"  Components: {len(components)} total, {len(ok_roots)} anchored, {len(orphan_roots)} orphan")
-    
-    # --- Step 4: Extend orphan strokes to nearest anchor (no separate bridges) ---
-    for root in orphan_roots:
-        indices = components[root]
+        if root == main_root:
+            continue
+
         best_dist = float('inf')
-        best_stroke_idx = None
-        best_point_idx = None
-        best_anchor = None
-        
-        # Find the nearest anchor point for any point in this orphan component
+        best_i = best_j = None
+        best_ep_a = best_ep_b = None
+
         for i in indices:
-            pi = strokes[i]["points"]
-            for pi_idx, p in enumerate(pi):
-                # Try extending to X=0 (stick)
-                d = abs(p[0])
-                if d < best_dist and d <= MAX_EXTEND_DIST:
-                    best_dist = d
-                    best_stroke_idx = i
-                    best_point_idx = pi_idx
-                    best_anchor = [0, int(p[1])]
-                
-                # Try extending to any stroke in an OK component
-                for ok_root in ok_roots:
-                    for j in components[ok_root]:
-                        pj = strokes[j]["points"]
-                        for q in pj:
-                            d = abs(p[0]-q[0]) + abs(p[1]-q[1])
-                            if d < best_dist and d <= MAX_EXTEND_DIST:
-                                best_dist = d
-                                best_stroke_idx = i
-                                best_point_idx = pi_idx
-                                best_anchor = [int(q[0]), int(q[1])]
-        
-        if best_anchor:
-            # Extend the orphan stroke by appending the anchor point
-            # Add to whichever end is closer
-            st = strokes[best_stroke_idx]
-            pts = st["points"]
-            start = np.array(pts[0])
-            end = np.array(pts[-1])
-            anchor = np.array(best_anchor)
-            
-            if np.linalg.norm(start - anchor) < np.linalg.norm(end - anchor):
-                # Prepend to start
-                st["points"] = [best_anchor] + pts
-            else:
-                # Append to end
-                st["points"] = pts + [best_anchor]
-            
-            extensions += 1
-            ok_roots.add(root)
-            print(f"    Extended stroke {best_stroke_idx} -> {best_anchor} (dist={best_dist:.0f})")
-        else:
-            # Orphan is too far from any anchor — skip (likely a small detail)
-            print(f"    Skipped orphan (too far, > {MAX_EXTEND_DIST})")
-    
-    # --- Step 5: Verify stick adhesion ---
-    if not any(crosses_stick(st) for st in strokes):
-        # No stroke touches the stick — anchor the nearest one
-        best_stroke = 0; best_dist = float('inf'); best_point = None
-        for idx, st in enumerate(strokes):
-            for p in st["points"]:
-                d = abs(p[0])
+            for j in range(n):
+                if j in indices:
+                    continue
+                d, ep_a, ep_b, _ = _nearest_endpoint_pair(strokes, i, j)
                 if d < best_dist:
-                    best_dist = d; best_stroke = idx; best_point = p
-        anchor = [0, int(best_point[1])]
-        strokes[best_stroke]["points"] = [anchor] + strokes[best_stroke]["points"]
-        print(f"  Stick anchor added: {anchor}")
-    else:
-        print(f"  Stick adhesion: OK")
-    
-    if extensions:
-        print(f"  Total extensions: {extensions}")
-    
+                    best_dist = d
+                    best_i, best_j = i, j
+                    best_ep_a, best_ep_b = ep_a, ep_b
+
+        if best_i is not None and best_dist <= 40:
+            dist = _extend_stroke_to_meet(strokes, best_i, best_ep_a,
+                                           best_j, best_ep_b)
+            for idx in indices:
+                parent[find(idx)] = main_root
+            print(f"    Connected orphan stroke {best_i} -> {best_j} (dist={dist:.0f})")
+        else:
+            print(f"    Kept orphan ({len(indices)} strokes, best_dist={best_dist:.0f})")
+
+
+def merge_short_strokes(strokes, min_pts=2, min_size=10, max_merge_dist=50, max_total_length=50,
+                         max_aspect_ratio=8.0):
+    """Absorb short or tiny strokes into neighboring strokes.
+
+    A stroke is considered 'mergeable' if:
+      - it has <= min_pts points, OR
+      - its bounding box is smaller than min_size in BOTH dimensions, OR
+      - its total path length < max_total_length (short arc)
+
+    A stroke is considered 'junk' (removed without merge) if:
+      - it has extreme aspect ratio (> max_aspect_ratio) AND is small (bbox area < 2000)
+
+    Only merges if the nearest endpoint is within max_merge_dist pixels.
+    """
+    if len(strokes) <= 1:
+        return strokes
+
+    def total_length(pts):
+        arr = np.array(pts)
+        return float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1)))
+
+    def is_mergeable(s):
+        pts = np.array(s["points"])
+        if len(pts) <= min_pts:
+            return True
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        if w < min_size and h < min_size:
+            return True
+        if total_length(s["points"]) < max_total_length:
+            return True
+        return False
+
+    def is_junk(s):
+        pts = np.array(s["points"])
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        area = (w + 1) * (h + 1)
+        if area > 2000:
+            return False
+        aspect = max(w, h) / max(min(w, h), 1)
+        return aspect > max_aspect_ratio
+
+    mergeable = [i for i, s in enumerate(strokes) if is_mergeable(s)]
+    if not mergeable:
+        return strokes
+
+    removed = set()
+    for si in mergeable:
+        if si in removed:
+            continue
+        s_pts = strokes[si]["points"]
+        s_start = np.array(s_pts[0])
+        s_end = np.array(s_pts[-1])
+        s_mid = (s_start + s_end) / 2
+
+        best_dist = float('inf')
+        best_li = None
+        best_lep = None
+
+        for li, ls in enumerate(strokes):
+            if li == si or li in removed:
+                continue
+            l_pts = ls["points"]
+            for ep_idx, ep in [(0, np.array(l_pts[0])), (-1, np.array(l_pts[-1]))]:
+                for sep in [s_start, s_end]:
+                    d = np.linalg.norm(ep - sep)
+                    if d < best_dist:
+                        best_dist = d
+                        best_li = li
+                        best_lep = ep_idx
+
+        if best_li is not None and best_dist <= max_merge_dist:
+            target = strokes[best_li]
+            t_pts = target["points"]
+            t_ep = np.array(t_pts[-1 if best_lep == -1 else 0])
+            mid = ((t_ep + s_mid) / 2).tolist()
+            if best_lep == -1:
+                target["points"] = t_pts + [mid] + s_pts
+            else:
+                target["points"] = s_pts + [mid] + t_pts
+            removed.add(si)
+            print(f"  Merged stroke {si} ({len(s_pts)}pts) into {best_li} (dist={best_dist:.0f})")
+
+    if removed:
+        strokes = [s for i, s in enumerate(strokes) if i not in removed]
+        print(f"  After merge: {len(strokes)} strokes")
+
+    removed2 = set()
+    for i, s in enumerate(strokes):
+        pts = np.array(s["points"])
+        w = pts[:, 0].max() - pts[:, 0].min()
+        h = pts[:, 1].max() - pts[:, 1].min()
+        length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        is_tiny = (w < min_size and h < min_size) or length < max_total_length
+        if is_tiny or is_junk(s):
+            removed2.add(i)
+            reason = "junk" if is_junk(s) else "tiny"
+            print(f"  Removed orphan {reason} stroke {i} ({len(pts)}pts, {w:.0f}x{h:.0f}, len={length:.0f})")
+
+    if removed2:
+        strokes = [s for i, s in enumerate(strokes) if i not in removed2]
+        print(f"  After orphan removal: {len(strokes)} strokes")
+
+    return strokes
+
+
+def connect_orphans_to_axis(strokes, max_connect_dist=60):
+    """Connect orphan strokes to nearest stroke endpoint or x=0 axis.
+
+    Skips strokes that already cross the x=0 axis (not orphans).
+    For remaining orphans, connects to the nearest stroke endpoint or axis.
+
+    This ensures sugar-painting continuity by linking isolated pieces
+    to the main structure or the stick.
+    """
+    if len(strokes) <= 1:
+        return strokes
+
+    def endpoint_dist(s1, ep1_idx, s2, ep2_idx):
+        p1 = np.array(s1["points"][ep1_idx])
+        p2 = np.array(s2["points"][ep2_idx])
+        return float(np.linalg.norm(p1 - p2))
+
+    def axis_dist(s, ep_idx):
+        return abs(s["points"][ep_idx][0])
+
+    def crosses_axis(s):
+        pts = np.array(s["points"])
+        x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
+        return x_min <= 0 <= x_max
+
+    connected_strokes = set()
+    changed = True
+    while changed:
+        changed = False
+        n = len(strokes)
+        if n <= 1:
+            break
+
+        for i in range(n):
+            if i in connected_strokes:
+                continue
+
+            si = strokes[i]
+            if crosses_axis(si):
+                continue
+
+            best_dist = float('inf')
+            best_action = None
+
+            for ep_i in [0, -1]:
+                for j in range(n):
+                    if j == i or j in connected_strokes:
+                        continue
+                    sj = strokes[j]
+                    for ep_j in [0, -1]:
+                        d = endpoint_dist(si, ep_i, sj, ep_j)
+                        if d < best_dist and d <= max_connect_dist and d > 1:
+                            best_dist = d
+                            best_action = ("stroke", i, ep_i, j, ep_j)
+
+            for ep_i in [0, -1]:
+                d_axis = axis_dist(si, ep_i)
+                if d_axis < best_dist and d_axis <= max_connect_dist and d_axis > 1:
+                    best_dist = d_axis
+                    best_action = ("axis", i, ep_i)
+
+            if best_action and best_action[0] == "axis":
+                _, idx, ep = best_action
+                pts = strokes[idx]["points"]
+                x = 0
+                y = pts[ep][1]
+                bridge = [x, y]
+                if ep == -1:
+                    strokes[idx]["points"] = pts + [bridge]
+                else:
+                    strokes[idx]["points"] = [bridge] + pts
+                connected_strokes.add(idx)
+                changed = True
+                print(f"  Connected stroke {idx} to axis at ({x},{y:.0f}), dist={best_dist:.0f}")
+                break
+
+            elif best_action and best_action[0] == "stroke":
+                _, idx_from, ep_from, idx_to, ep_to = best_action
+                _extend_stroke_to_meet(strokes, idx_from, ep_from, idx_to, ep_to)
+                connected_strokes.add(idx_from)
+                connected_strokes.add(idx_to)
+                changed = True
+                print(f"  Connected stroke {idx_from} to stroke {idx_to}, dist={best_dist:.0f}")
+                break
+
     return strokes
 
 
@@ -749,47 +1136,39 @@ def _render_panel(draw, strokes, x_offset, sz, label):
     draw.text((x_offset + 10, 8), f"{label} ({n} strokes, {p} pts)", fill="#666")
 
 
-def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15,
-                         drop_border=True, min_stroke_points=2, start_from="center"):
+def _run_single_pipeline(gray_arr, mode, threshold=None, min_contour_area=50, prune=15):
     defaults = MODE_DEFAULTS[mode]
     if mode == "lineart":
         binary = binarize_lineart(gray_arr, threshold=threshold)
     else:
         binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
-    if drop_border:                                       # (a) kill border medial axis
-        binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
+    filled_strokes, binary = extract_filled_regions(binary)
+    thin_strokes, binary = extract_thin_features(binary)
     skel = skeletonize(binary)
     print(f"  Skeleton: {np.count_nonzero(skel)} pixels")
     if prune > 0:
-        skel = prune_skeleton(skel, max_spur=prune)
+        skel = prune_skeleton_adaptive(skel, max_spur=prune)
         print(f"  Pruned: {np.count_nonzero(skel)} pixels")
-    paths = extract_all_paths(skel, min_stroke_points=min_stroke_points,
-                              start_from=start_from)
-    if drop_border and paths:                             # (b) drop frame-hugging strokes
-        h, w = skel.shape
-        paths = [p for p in paths if not bbox_hugs_border(p, h, w)]
-    if not paths:
+    paths = extract_all_paths(skel)
+    all_strokes = filled_strokes + thin_strokes + paths
+    if not all_strokes:
         return [], {}
-    smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in paths]
-    strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"],
-                              min_stroke_points=min_stroke_points)
+    smoothed = [smooth_path(s, sigma=defaults["sigma"]) for s in all_strokes]
+    strokes = scale_to_canvas(smoothed, defaults["eps"], defaults["resample"])
     strokes = enforce_connectivity(strokes)
+    strokes = merge_short_strokes(strokes)
+    strokes = connect_orphans_to_axis(strokes)
     strokes = optimize_stroke_order(strokes)
     return strokes, defaults
 
 
-def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=15,
-                   drop_border=True, min_stroke_points=2, start_from="center"):
+def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_area=50, prune=5):
     from PIL import ImageDraw
     print("\n== Line Art Mode ==")
-    strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune,
-                                         drop_border=drop_border, min_stroke_points=min_stroke_points,
-                                         start_from=start_from)
+    strokes_la, _ = _run_single_pipeline(gray_arr, "lineart", threshold=lineart_threshold, prune=prune)
     plan_la = build_plan(strokes_la, "Line art mode")
     print("\n== Photo Mode ==")
-    strokes_ph, _ = _run_single_pipeline(gray_arr, "photo", min_contour_area=min_contour_area, prune=prune,
-                                         drop_border=drop_border, min_stroke_points=min_stroke_points,
-                                         start_from=start_from)
+    strokes_ph, _ = _run_single_pipeline(gray_arr, "photo", min_contour_area=min_contour_area, prune=prune)
     plan_ph = build_plan(strokes_ph, "Photo mode")
     base = output_path.replace('.json', '')
     write_outputs(plan_la, f"{base}_lineart.json")
@@ -812,61 +1191,10 @@ def run_comparison(gray_arr, output_path, lineart_threshold=None, min_contour_ar
 
 # --- Main Pipeline -----------------------------------------------------------
 
-def image_to_trajectory(image_path, mode="auto", max_dim=None,
-                        smooth_sigma=None, simplify_eps=None, resample_n=None,
-                        threshold=None, min_contour_area=50, prune=15,
-                        drop_border=True, min_stroke_points=2, start_from="center"):
-    """Run the CV pipeline and return a plan dict ({description, strokes}) WITHOUT writing files.
-
-    This is the library entry point used by gif_service's /trace endpoint.
-    main() wraps this + write_outputs for the CLI.
-
-    drop_border: zero the mask border + drop frame-hugging skeleton strokes
-                 (removes the canvas-frame medial axis).
-    min_stroke_points: drop strokes shorter than this (trivial junction fragments).
-    """
-    if mode == "auto":
-        img_tmp = Image.open(image_path).convert("L")
-        arr_tmp = np.array(img_tmp)
-        mode = detect_source_type(arr_tmp)
-        print(f"Auto-detected: {mode}")
-    defaults = MODE_DEFAULTS[mode]
-    max_dim = max_dim or defaults["max_dim"]
-    smooth_sigma = smooth_sigma if smooth_sigma is not None else defaults["sigma"]
-    simplify_eps = simplify_eps if simplify_eps is not None else defaults["eps"]
-    resample_n = resample_n if resample_n is not None else defaults["resample"]
-    gray_arr, orig_size = load_and_resize(image_path, max_dim)
-    print(f"Mode: {mode} | sigma={smooth_sigma} eps={simplify_eps} "
-          f"resample={resample_n} max_dim={max_dim}")
-    print("Binarizing...")
-    binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
-        else binarize_photo(gray_arr, min_contour_area=min_contour_area)
-    if drop_border:                                       # (a) kill border medial axis
-        binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
-    print("Skeletonizing...")
-    skel = skeletonize(binary)
-    if prune > 0:
-        skel = prune_skeleton(skel, max_spur=prune)
-    print("Tracing skeleton graph...")
-    strokes_raw = extract_all_paths(skel, min_stroke_points=min_stroke_points,
-                                    start_from=start_from)
-    if drop_border and strokes_raw:                       # (b) drop frame-hugging strokes
-        h, w = skel.shape
-        strokes_raw = [p for p in strokes_raw if not bbox_hugs_border(p, h, w)]
-    if not strokes_raw:
-        raise ValueError("no strokes found")
-    strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
-    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n,
-                              min_stroke_points=min_stroke_points)
-    strokes = enforce_connectivity(strokes)
-    strokes = optimize_stroke_order(strokes)
-    return build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
-
-
 def main(image_path, output_path, mode="auto", max_dim=None,
          smooth_sigma=None, simplify_eps=None, resample_n=None,
-         threshold=None, min_contour_area=50, prune=15, compare=False, debug=False,
-         drop_border=True, min_stroke_points=2, start_from="center"):
+         threshold=None, min_contour_area=50, prune=2, compare=False, debug=False,
+         min_component_pixels=15):
     if mode == "auto":
         img_tmp = Image.open(image_path).convert("L")
         arr_tmp = np.array(img_tmp)
@@ -879,29 +1207,58 @@ def main(image_path, output_path, mode="auto", max_dim=None,
     resample_n = resample_n if resample_n is not None else defaults["resample"]
     gray_arr, orig_size = load_and_resize(image_path, max_dim)
     if compare:
-        run_comparison(gray_arr, output_path, lineart_threshold=threshold,
-                       min_contour_area=min_contour_area, prune=prune,
-                       drop_border=drop_border, min_stroke_points=min_stroke_points,
-                       start_from=start_from)
+        run_comparison(gray_arr, output_path, lineart_threshold=threshold, min_contour_area=min_contour_area, prune=prune)
         return
+    print(f"Mode: {mode} | sigma={smooth_sigma} eps={simplify_eps} "
+          f"resample={resample_n} max_dim={max_dim}")
+    print("Binarizing...")
+    if mode == "lineart":
+        binary = binarize_lineart(gray_arr, threshold=threshold)
+    else:
+        binary = binarize_photo(gray_arr, min_contour_area=min_contour_area)
+    print("Extracting filled regions (eyes, etc.)...")
+    filled_strokes, binary = extract_filled_regions(binary)
+    print("Extracting thin features (whiskers, etc.)...")
+    thin_strokes, binary = extract_thin_features(binary)
+    print("Skeletonizing...")
+    skel = skeletonize(binary)
+    print(f"Skeleton: {np.count_nonzero(skel)} pixels")
+    if prune > 0:
+        skel = prune_skeleton_adaptive(skel, max_spur=prune,
+                                       min_component_pixels=min_component_pixels)
+        print(f"Pruned: {np.count_nonzero(skel)} pixels (max_spur={prune})")
     if debug:
-        # need binary + skel for debug images; recompute here (debug is CLI-only)
-        binary = binarize_lineart(gray_arr, threshold=threshold) if mode == "lineart" \
-            else binarize_photo(gray_arr, min_contour_area=min_contour_area)
-        if drop_border:
-            binary[:3, :] = 0; binary[-3:, :] = 0; binary[:, :3] = 0; binary[:, -3:] = 0
-        skel = skeletonize(binary)
-        if prune > 0:
-            skel = prune_skeleton(skel, max_spur=prune)
         save_debug_images(binary, skel, output_path)
-    plan = image_to_trajectory(image_path, mode=mode, max_dim=max_dim,
-                               smooth_sigma=smooth_sigma, simplify_eps=simplify_eps,
-                               resample_n=resample_n, threshold=threshold,
-                               min_contour_area=min_contour_area, prune=prune,
-                               drop_border=drop_border, min_stroke_points=min_stroke_points,
-                               start_from=start_from)
-    total = sum(len(st["points"]) for st in plan["strokes"])
-    print(f"Final: {len(plan['strokes'])} strokes, {total} points")
+    print("Tracing skeleton graph...")
+    strokes_raw = extract_all_paths(skel)
+    print(f"Extracted {len(strokes_raw)} skeleton paths")
+    if filled_strokes:
+        print(f"Adding {len(filled_strokes)} filled-region contour strokes")
+    if thin_strokes:
+        print(f"Adding {len(thin_strokes)} thin-feature strokes (whiskers)")
+    strokes_raw = filled_strokes + thin_strokes + strokes_raw
+    print(f"Total paths: {len(strokes_raw)}")
+    if not strokes_raw:
+        print("No strokes found!"); return
+    print(f"Smoothing (sigma={smooth_sigma})...")
+    strokes_smooth = [smooth_path(s, sigma=smooth_sigma) for s in strokes_raw]
+    strokes = scale_to_canvas(strokes_smooth, simplify_eps, resample_n)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Before connectivity: {len(strokes)} strokes, {total} points")
+    print("Enforcing connectivity...")
+    strokes = enforce_connectivity(strokes, connect_threshold=15)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Merging short strokes...")
+    strokes = merge_short_strokes(strokes)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Connecting orphans to axis/strokes...")
+    strokes = connect_orphans_to_axis(strokes)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Optimizing stroke order...")
+    strokes = optimize_stroke_order(strokes)
+    total = sum(len(st["points"]) for st in strokes)
+    print(f"Final: {len(strokes)} strokes, {total} points")
+    plan = build_plan(strokes, f"{mode} ({len(strokes)} strokes)")
     write_outputs(plan, output_path)
 
 
@@ -931,32 +1288,18 @@ Examples:
                         help="Max image dimension in pixels")
     parser.add_argument("--resample", type=int, default=None,
                         help="Target points per stroke")
-    parser.add_argument("--prune", type=int, default=15,
-                        help="Skeleton pruning iterations (default: 15)")
+    parser.add_argument("--prune", type=int, default=2,
+                        help="Skeleton pruning iterations (default: 2)")
     parser.add_argument("--min-contour", type=int, default=50, dest="min_contour_area",
                         help="Min contour area to keep (photo mode, default: 50)")
+    parser.add_argument("--min-component", type=int, default=15, dest="min_component_pixels",
+                        help="Min component size for adaptive pruning (default: 15)")
     parser.add_argument("--threshold", type=int, default=None,
                         help="Manual threshold (lineart only)")
     parser.add_argument("--compare", action="store_true",
                         help="Run both modes, side-by-side comparison")
     parser.add_argument("--debug", action="store_true",
                         help="Save intermediate images")
-    border_group = parser.add_mutually_exclusive_group()
-    border_group.add_argument("--drop-border", dest="drop_border", action="store_true",
-                              default=True, help="Drop the canvas-frame skeleton: "
-                              "zero the mask border + drop frame-hugging strokes "
-                              "(default)")
-    border_group.add_argument("--keep-border", dest="drop_border", action="store_false",
-                              help="Keep border-touching skeleton strokes")
-    parser.add_argument("--min-stroke-points", type=int, default=2, dest="min_stroke_points",
-                        help="Drop strokes with fewer than this many points "
-                             "(default 2 keeps short features like whiskers/eyes; raise to 4 "
-                             "to drop trivial junction fragments)")
-    parser.add_argument("--start-from", choices=["nearest", "center"], default="center",
-                        dest="start_from", help="Remaining-skeleton start point: 'center' "
-                        "(default) keeps long curves as independent strokes (detail-preserving, "
-                        "matches the old version); 'nearest' extends/merges collinear long runs "
-                        "(use for filled blobs like love.png)")
     return parser.parse_args()
 
 
@@ -975,7 +1318,5 @@ if __name__ == "__main__":
         prune=args.prune,
         compare=args.compare,
         debug=args.debug,
-        drop_border=args.drop_border,
-        min_stroke_points=args.min_stroke_points,
-        start_from=args.start_from,
+        min_component_pixels=args.min_component_pixels,
     )
